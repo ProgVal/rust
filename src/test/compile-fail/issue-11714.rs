@@ -8,8 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-fn blah() -> i32 { //~ ERROR not all control paths return a value
-    //~^ HELP run `rustc --explain E0269` to see a detailed explanation
+fn blah() -> i32 { //~ ERROR mismatched types
     1
 
     ; //~ HELP consider removing this semicolon:

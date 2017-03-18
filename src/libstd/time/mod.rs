@@ -34,7 +34,7 @@ pub use self::duration::Duration;
 mod duration;
 
 /// A measurement of a monotonically increasing clock.
-///  Opaque and useful only with `Duration`.
+/// Opaque and useful only with `Duration`.
 ///
 /// Instants are always guaranteed to be greater than any previously measured
 /// instant when created, and are often useful for tasks such as measuring
@@ -73,22 +73,27 @@ pub struct Instant(time::Instant);
 /// A measurement of the system clock, useful for talking to
 /// external entities like the file system or other processes.
 ///
-/// Distinct from the `Instant` type, this time measurement **is not
+/// Distinct from the [`Instant`] type, this time measurement **is not
 /// monotonic**. This means that you can save a file to the file system, then
 /// save another file to the file system, **and the second file has a
-/// `SystemTime` measurement earlier than the second**. In other words, an
+/// `SystemTime` measurement earlier than the first**. In other words, an
 /// operation that happens after another operation in real time may have an
 /// earlier `SystemTime`!
 ///
 /// Consequently, comparing two `SystemTime` instances to learn about the
-/// duration between them returns a `Result` instead of an infallible `Duration`
+/// duration between them returns a [`Result`] instead of an infallible [`Duration`]
 /// to indicate that this sort of time drift may happen and needs to be handled.
 ///
-/// Although a `SystemTime` cannot be directly inspected, the `UNIX_EPOCH`
+/// Although a `SystemTime` cannot be directly inspected, the [`UNIX_EPOCH`]
 /// constant is provided in this module as an anchor in time to learn
 /// information about a `SystemTime`. By calculating the duration from this
 /// fixed point in time, a `SystemTime` can be converted to a human-readable time,
 /// or perhaps some other string representation.
+///
+/// [`Instant`]: ../../std/time/struct.Instant.html
+/// [`Result`]: ../../std/result/enum.Result.html
+/// [`Duration`]: ../../std/time/struct.Duration.html
+/// [`UNIX_EPOCH`]: ../../std/time/constant.UNIX_EPOCH.html
 ///
 /// Example:
 ///
@@ -117,14 +122,38 @@ pub struct Instant(time::Instant);
 #[stable(feature = "time2", since = "1.8.0")]
 pub struct SystemTime(time::SystemTime);
 
-/// An error returned from the `duration_since` method on `SystemTime`,
-/// used to learn about why how far in the opposite direction a timestamp lies.
+/// An error returned from the `duration_since` and `elapsed` methods on
+/// `SystemTime`, used to learn how far in the opposite direction a system time
+/// lies.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::thread::sleep;
+/// use std::time::{Duration, SystemTime};
+///
+/// let sys_time = SystemTime::now();
+/// sleep(Duration::from_secs(1));
+/// let new_sys_time = SystemTime::now();
+/// match sys_time.duration_since(new_sys_time) {
+///     Ok(_) => {}
+///     Err(e) => println!("SystemTimeError difference: {:?}", e.duration()),
+/// }
+/// ```
 #[derive(Clone, Debug)]
 #[stable(feature = "time2", since = "1.8.0")]
 pub struct SystemTimeError(Duration);
 
 impl Instant {
     /// Returns an instant corresponding to "now".
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Instant;
+    ///
+    /// let now = Instant::now();
+    /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn now() -> Instant {
         Instant(time::Instant::now())
@@ -138,15 +167,20 @@ impl Instant {
     /// only be possible if `earlier` was created after `self`. Because
     /// `Instant` is monotonic, the only time that this should happen should be
     /// a bug.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::{Duration, Instant};
+    /// use std::thread::sleep;
+    ///
+    /// let now = Instant::now();
+    /// sleep(Duration::new(1, 0));
+    /// let new_now = Instant::now();
+    /// println!("{:?}", new_now.duration_since(now));
+    /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn duration_since(&self, earlier: Instant) -> Duration {
-        self.0.sub_instant(&earlier.0)
-    }
-
-    /// Deprecated, renamed to `duration_since`
-    #[unstable(feature = "time2_old", issue = "29866")]
-    #[rustc_deprecated(since = "1.8.0", reason = "renamed to duration_since")]
-    pub fn duration_from_earlier(&self, earlier: Instant) -> Duration {
         self.0.sub_instant(&earlier.0)
     }
 
@@ -157,6 +191,18 @@ impl Instant {
     /// This function may panic if the current time is earlier than this
     /// instant, which is something that can happen if an `Instant` is
     /// produced synthetically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::thread::sleep;
+    /// use std::time::{Duration, Instant};
+    ///
+    /// let instant = Instant::now();
+    /// let three_secs = Duration::from_secs(3);
+    /// sleep(three_secs);
+    /// assert!(instant.elapsed() >= three_secs);
+    /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn elapsed(&self) -> Duration {
         Instant::now() - *self
@@ -213,6 +259,14 @@ impl fmt::Debug for Instant {
 
 impl SystemTime {
     /// Returns the system time corresponding to "now".
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::SystemTime;
+    ///
+    /// let sys_time = SystemTime::now();
+    /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn now() -> SystemTime {
         SystemTime(time::SystemTime::now())
@@ -224,22 +278,29 @@ impl SystemTime {
     /// guaranteed to always be before later measurements (due to anomalies such
     /// as the system clock being adjusted either forwards or backwards).
     ///
-    /// If successful, `Ok(Duration)` is returned where the duration represents
+    /// If successful, [`Ok`]`(`[`Duration`]`)` is returned where the duration represents
     /// the amount of time elapsed from the specified measurement to this one.
     ///
-    /// Returns an `Err` if `earlier` is later than `self`, and the error
+    /// Returns an [`Err`] if `earlier` is later than `self`, and the error
     /// contains how far from `self` the time is.
+    ///
+    /// [`Ok`]: ../../std/result/enum.Result.html#variant.Ok
+    /// [`Duration`]: ../../std/time/struct.Duration.html
+    /// [`Err`]: ../../std/result/enum.Result.html#variant.Err
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::SystemTime;
+    ///
+    /// let sys_time = SystemTime::now();
+    /// let difference = sys_time.duration_since(sys_time)
+    ///                          .expect("SystemTime::duration_since failed");
+    /// println!("{:?}", difference);
+    /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn duration_since(&self, earlier: SystemTime)
                           -> Result<Duration, SystemTimeError> {
-        self.0.sub_time(&earlier.0).map_err(SystemTimeError)
-    }
-
-    /// Deprecated, renamed to `duration_since`
-    #[unstable(feature = "time2_old", issue = "29866")]
-    #[rustc_deprecated(since = "1.8.0", reason = "renamed to duration_since")]
-    pub fn duration_from_earlier(&self, earlier: SystemTime)
-                                 -> Result<Duration, SystemTimeError> {
         self.0.sub_time(&earlier.0).map_err(SystemTimeError)
     }
 
@@ -247,12 +308,28 @@ impl SystemTime {
     ///
     /// This function may fail as the underlying system clock is susceptible to
     /// drift and updates (e.g. the system clock could go backwards), so this
-    /// function may not always succeed. If successful, `Ok(duration)` is
+    /// function may not always succeed. If successful, [`Ok`]`(`[`Duration`]`)` is
     /// returned where the duration represents the amount of time elapsed from
     /// this time measurement to the current time.
     ///
-    /// Returns an `Err` if `self` is later than the current system time, and
+    /// Returns an [`Err`] if `self` is later than the current system time, and
     /// the error contains how far from the current system time `self` is.
+    ///
+    /// [`Ok`]: ../../std/result/enum.Result.html#variant.Ok
+    /// [`Duration`]: ../../std/time/struct.Duration.html
+    /// [`Err`]: ../../std/result/enum.Result.html#variant.Err
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::thread::sleep;
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let sys_time = SystemTime::now();
+    /// let one_sec = Duration::from_secs(1);
+    /// sleep(one_sec);
+    /// assert!(sys_time.elapsed().unwrap() >= one_sec);
+    /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn elapsed(&self) -> Result<Duration, SystemTimeError> {
         SystemTime::now().duration_since(*self)
@@ -303,9 +380,11 @@ impl fmt::Debug for SystemTime {
 ///
 /// This constant is defined to be "1970-01-01 00:00:00 UTC" on all systems with
 /// respect to the system clock. Using `duration_since` on an existing
-/// `SystemTime` instance can tell how far away from this point in time a
+/// [`SystemTime`] instance can tell how far away from this point in time a
 /// measurement lies, and using `UNIX_EPOCH + duration` can be used to create a
-/// `SystemTime` instance to represent another fixed point in time.
+/// [`SystemTime`] instance to represent another fixed point in time.
+///
+/// [`SystemTime`]: ../../std/time/struct.SystemTime.html
 #[stable(feature = "time2", since = "1.8.0")]
 pub const UNIX_EPOCH: SystemTime = SystemTime(time::UNIX_EPOCH);
 
@@ -313,9 +392,28 @@ impl SystemTimeError {
     /// Returns the positive duration which represents how far forward the
     /// second system time was from the first.
     ///
-    /// A `SystemTimeError` is returned from the `duration_since`
-    /// operation whenever the second system time represents a point later
+    /// A `SystemTimeError` is returned from the [`duration_since`] and [`elapsed`]
+    /// methods of [`SystemTime`] whenever the second system time represents a point later
     /// in time than the `self` of the method call.
+    ///
+    /// [`duration_since`]: ../../std/time/struct.SystemTime.html#method.duration_since
+    /// [`elapsed`]: ../../std/time/struct.SystemTime.html#method.elapsed
+    /// [`SystemTime`]: ../../std/time/struct.SystemTime.html
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::thread::sleep;
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let sys_time = SystemTime::now();
+    /// sleep(Duration::from_secs(1));
+    /// let new_sys_time = SystemTime::now();
+    /// match sys_time.duration_since(new_sys_time) {
+    ///     Ok(_) => {}
+    ///     Err(e) => println!("SystemTimeError difference: {:?}", e.duration()),
+    /// }
+    /// ```
     #[stable(feature = "time2", since = "1.8.0")]
     pub fn duration(&self) -> Duration {
         self.0

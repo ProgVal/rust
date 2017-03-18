@@ -15,6 +15,9 @@ build = "build.rs"
 [lib]
 name = "libc"
 path = "../../liblibc/src/lib.rs"
+test = false
+bench = false
+doc = false
 
 [dependencies]
 core = { path = "../../libcore" }

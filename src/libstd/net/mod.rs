@@ -12,8 +12,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use prelude::v1::*;
-
+use fmt;
 use io::{self, Error, ErrorKind};
 use sys_common::net as net_imp;
 
@@ -33,10 +32,15 @@ mod addr;
 mod tcp;
 mod udp;
 mod parser;
-#[cfg(test)] mod test;
+#[cfg(test)]
+mod test;
 
-/// Possible values which can be passed to the `shutdown` method of `TcpStream`.
-#[derive(Copy, Clone, PartialEq, Debug)]
+/// Possible values which can be passed to the [`shutdown`] method of
+/// [`TcpStream`].
+///
+/// [`shutdown`]: struct.TcpStream.html#method.shutdown
+/// [`TcpStream`]: struct.TcpStream.html
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub enum Shutdown {
     /// Indicates that the reading portion of this stream/socket should be shut
@@ -98,14 +102,27 @@ pub struct LookupHost(net_imp::LookupHost);
                                               addresses",
            issue = "27705")]
 impl Iterator for LookupHost {
-    type Item = io::Result<SocketAddr>;
-    fn next(&mut self) -> Option<io::Result<SocketAddr>> { self.0.next() }
+    type Item = SocketAddr;
+    fn next(&mut self) -> Option<SocketAddr> { self.0.next() }
+}
+
+#[unstable(feature = "lookup_host", reason = "unsure about the returned \
+                                              iterator and returning socket \
+                                              addresses",
+           issue = "27705")]
+impl fmt::Debug for LookupHost {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("LookupHost { .. }")
+    }
 }
 
 /// Resolve the host specified by `host` as a number of `SocketAddr` instances.
 ///
 /// This method may perform a DNS query to resolve `host` and may also inspect
 /// system configuration to resolve the specified hostname.
+///
+/// The returned iterator will skip over any unknown addresses returned by the
+/// operating system.
 ///
 /// # Examples
 ///
@@ -115,8 +132,8 @@ impl Iterator for LookupHost {
 /// use std::net;
 ///
 /// # fn foo() -> std::io::Result<()> {
-/// for host in try!(net::lookup_host("rust-lang.org")) {
-///     println!("found address: {}", try!(host));
+/// for host in net::lookup_host("rust-lang.org")? {
+///     println!("found address: {}", host);
 /// }
 /// # Ok(())
 /// # }

@@ -8,24 +8,53 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use middle::def_id::DefId;
-use infer::InferCtxt;
+use hir::def_id::DefId;
 use ty::subst::{Subst, Substs};
 use ty::{self, Ty, TyCtxt, ToPredicate, ToPolyTraitRef};
-use syntax::codemap::Span;
-use util::common::ErrorReported;
-use util::nodemap::FnvHashSet;
+use ty::outlives::Component;
+use util::nodemap::FxHashSet;
 
 use super::{Obligation, ObligationCause, PredicateObligation, SelectionContext, Normalized};
 
-struct PredicateSet<'a,'tcx:'a> {
-    tcx: &'a TyCtxt<'tcx>,
-    set: FnvHashSet<ty::Predicate<'tcx>>,
+fn anonymize_predicate<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
+                                       pred: &ty::Predicate<'tcx>)
+                                       -> ty::Predicate<'tcx> {
+    match *pred {
+        ty::Predicate::Trait(ref data) =>
+            ty::Predicate::Trait(tcx.anonymize_late_bound_regions(data)),
+
+        ty::Predicate::Equate(ref data) =>
+            ty::Predicate::Equate(tcx.anonymize_late_bound_regions(data)),
+
+        ty::Predicate::RegionOutlives(ref data) =>
+            ty::Predicate::RegionOutlives(tcx.anonymize_late_bound_regions(data)),
+
+        ty::Predicate::TypeOutlives(ref data) =>
+            ty::Predicate::TypeOutlives(tcx.anonymize_late_bound_regions(data)),
+
+        ty::Predicate::Projection(ref data) =>
+            ty::Predicate::Projection(tcx.anonymize_late_bound_regions(data)),
+
+        ty::Predicate::WellFormed(data) =>
+            ty::Predicate::WellFormed(data),
+
+        ty::Predicate::ObjectSafe(data) =>
+            ty::Predicate::ObjectSafe(data),
+
+        ty::Predicate::ClosureKind(closure_def_id, kind) =>
+            ty::Predicate::ClosureKind(closure_def_id, kind)
+    }
 }
 
-impl<'a,'tcx> PredicateSet<'a,'tcx> {
-    fn new(tcx: &'a TyCtxt<'tcx>) -> PredicateSet<'a,'tcx> {
-        PredicateSet { tcx: tcx, set: FnvHashSet() }
+
+struct PredicateSet<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+    tcx: TyCtxt<'a, 'gcx, 'tcx>,
+    set: FxHashSet<ty::Predicate<'tcx>>,
+}
+
+impl<'a, 'gcx, 'tcx> PredicateSet<'a, 'gcx, 'tcx> {
+    fn new(tcx: TyCtxt<'a, 'gcx, 'tcx>) -> PredicateSet<'a, 'gcx, 'tcx> {
+        PredicateSet { tcx: tcx, set: FxHashSet() }
     }
 
     fn insert(&mut self, pred: &ty::Predicate<'tcx>) -> bool {
@@ -39,29 +68,7 @@ impl<'a,'tcx> PredicateSet<'a,'tcx> {
         //
         // to be considered equivalent. So normalize all late-bound
         // regions before we throw things into the underlying set.
-        let normalized_pred = match *pred {
-            ty::Predicate::Trait(ref data) =>
-                ty::Predicate::Trait(self.tcx.anonymize_late_bound_regions(data)),
-
-            ty::Predicate::Equate(ref data) =>
-                ty::Predicate::Equate(self.tcx.anonymize_late_bound_regions(data)),
-
-            ty::Predicate::RegionOutlives(ref data) =>
-                ty::Predicate::RegionOutlives(self.tcx.anonymize_late_bound_regions(data)),
-
-            ty::Predicate::TypeOutlives(ref data) =>
-                ty::Predicate::TypeOutlives(self.tcx.anonymize_late_bound_regions(data)),
-
-            ty::Predicate::Projection(ref data) =>
-                ty::Predicate::Projection(self.tcx.anonymize_late_bound_regions(data)),
-
-            ty::Predicate::WellFormed(data) =>
-                ty::Predicate::WellFormed(data),
-
-            ty::Predicate::ObjectSafe(data) =>
-                ty::Predicate::ObjectSafe(data),
-        };
-        self.set.insert(normalized_pred)
+        self.set.insert(anonymize_predicate(self.tcx, pred))
     }
 }
 
@@ -76,24 +83,23 @@ impl<'a,'tcx> PredicateSet<'a,'tcx> {
 /// that `T : PartialOrd` holds as well. Similarly, if we have `trait
 /// Foo : 'static`, and we know that `T : Foo`, then we know that `T :
 /// 'static`.
-pub struct Elaborator<'cx, 'tcx:'cx> {
-    tcx: &'cx TyCtxt<'tcx>,
+pub struct Elaborator<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     stack: Vec<ty::Predicate<'tcx>>,
-    visited: PredicateSet<'cx,'tcx>,
+    visited: PredicateSet<'a, 'gcx, 'tcx>,
 }
 
-pub fn elaborate_trait_ref<'cx, 'tcx>(
-    tcx: &'cx TyCtxt<'tcx>,
+pub fn elaborate_trait_ref<'cx, 'gcx, 'tcx>(
+    tcx: TyCtxt<'cx, 'gcx, 'tcx>,
     trait_ref: ty::PolyTraitRef<'tcx>)
-    -> Elaborator<'cx, 'tcx>
+    -> Elaborator<'cx, 'gcx, 'tcx>
 {
     elaborate_predicates(tcx, vec![trait_ref.to_predicate()])
 }
 
-pub fn elaborate_trait_refs<'cx, 'tcx>(
-    tcx: &'cx TyCtxt<'tcx>,
+pub fn elaborate_trait_refs<'cx, 'gcx, 'tcx>(
+    tcx: TyCtxt<'cx, 'gcx, 'tcx>,
     trait_refs: &[ty::PolyTraitRef<'tcx>])
-    -> Elaborator<'cx, 'tcx>
+    -> Elaborator<'cx, 'gcx, 'tcx>
 {
     let predicates = trait_refs.iter()
                                .map(|trait_ref| trait_ref.to_predicate())
@@ -101,31 +107,32 @@ pub fn elaborate_trait_refs<'cx, 'tcx>(
     elaborate_predicates(tcx, predicates)
 }
 
-pub fn elaborate_predicates<'cx, 'tcx>(
-    tcx: &'cx TyCtxt<'tcx>,
+pub fn elaborate_predicates<'cx, 'gcx, 'tcx>(
+    tcx: TyCtxt<'cx, 'gcx, 'tcx>,
     mut predicates: Vec<ty::Predicate<'tcx>>)
-    -> Elaborator<'cx, 'tcx>
+    -> Elaborator<'cx, 'gcx, 'tcx>
 {
     let mut visited = PredicateSet::new(tcx);
     predicates.retain(|pred| visited.insert(pred));
-    Elaborator { tcx: tcx, stack: predicates, visited: visited }
+    Elaborator { stack: predicates, visited: visited }
 }
 
-impl<'cx, 'tcx> Elaborator<'cx, 'tcx> {
-    pub fn filter_to_traits(self) -> FilterToTraits<Elaborator<'cx, 'tcx>> {
+impl<'cx, 'gcx, 'tcx> Elaborator<'cx, 'gcx, 'tcx> {
+    pub fn filter_to_traits(self) -> FilterToTraits<Self> {
         FilterToTraits::new(self)
     }
 
     fn push(&mut self, predicate: &ty::Predicate<'tcx>) {
+        let tcx = self.visited.tcx;
         match *predicate {
             ty::Predicate::Trait(ref data) => {
                 // Predicates declared on the trait.
-                let predicates = self.tcx.lookup_super_predicates(data.def_id());
+                let predicates = tcx.item_super_predicates(data.def_id());
 
                 let mut predicates: Vec<_> =
                     predicates.predicates
                               .iter()
-                              .map(|p| p.subst_supertrait(self.tcx, &data.to_poly_trait_ref()))
+                              .map(|p| p.subst_supertrait(tcx, &data.to_poly_trait_ref()))
                               .collect();
 
                 debug!("super_predicates: data={:?} predicates={:?}",
@@ -156,33 +163,72 @@ impl<'cx, 'tcx> Elaborator<'cx, 'tcx> {
             ty::Predicate::Projection(..) => {
                 // Nothing to elaborate in a projection predicate.
             }
-            ty::Predicate::RegionOutlives(..) |
-            ty::Predicate::TypeOutlives(..) => {
-                // Currently, we do not "elaborate" predicates like
-                // `'a : 'b` or `T : 'a`.  We could conceivably do
-                // more here.  For example,
+            ty::Predicate::ClosureKind(..) => {
+                // Nothing to elaborate when waiting for a closure's kind to be inferred.
+            }
+
+            ty::Predicate::RegionOutlives(..) => {
+                // Nothing to elaborate from `'a: 'b`.
+            }
+
+            ty::Predicate::TypeOutlives(ref data) => {
+                // We know that `T: 'a` for some type `T`. We can
+                // often elaborate this. For example, if we know that
+                // `[U]: 'a`, that implies that `U: 'a`. Similarly, if
+                // we know `&'a U: 'b`, then we know that `'a: 'b` and
+                // `U: 'b`.
                 //
-                //     &'a int : 'b
-                //
-                // implies that
-                //
-                //     'a : 'b
-                //
-                // and we could get even more if we took WF
-                // constraints into account. For example,
-                //
-                //     &'a &'b int : 'c
-                //
-                // implies that
-                //
-                //     'b : 'a
-                //     'a : 'c
+                // We can basically ignore bound regions here. So for
+                // example `for<'c> Foo<'a,'c>: 'b` can be elaborated to
+                // `'a: 'b`.
+
+                // Ignore `for<'a> T: 'a` -- we might in the future
+                // consider this as evidence that `T: 'static`, but
+                // I'm a bit wary of such constructions and so for now
+                // I want to be conservative. --nmatsakis
+                let ty_max = data.skip_binder().0;
+                let r_min = data.skip_binder().1;
+                if r_min.is_bound() {
+                    return;
+                }
+
+                let visited = &mut self.visited;
+                self.stack.extend(
+                    tcx.outlives_components(ty_max)
+                       .into_iter()
+                       .filter_map(|component| match component {
+                           Component::Region(r) => if r.is_bound() {
+                               None
+                           } else {
+                               Some(ty::Predicate::RegionOutlives(
+                                   ty::Binder(ty::OutlivesPredicate(r, r_min))))
+                           },
+
+                           Component::Param(p) => {
+                               let ty = tcx.mk_param(p.idx, p.name);
+                               Some(ty::Predicate::TypeOutlives(
+                                   ty::Binder(ty::OutlivesPredicate(ty, r_min))))
+                           },
+
+                           Component::UnresolvedInferenceVariable(_) => {
+                               None
+                           },
+
+                           Component::Projection(_) |
+                           Component::EscapingProjection(_) => {
+                               // We can probably do more here. This
+                               // corresponds to a case like `<T as
+                               // Foo<'a>>::U: 'b`.
+                               None
+                           },
+                       })
+                       .filter(|p| visited.insert(p)));
             }
         }
     }
 }
 
-impl<'cx, 'tcx> Iterator for Elaborator<'cx, 'tcx> {
+impl<'cx, 'gcx, 'tcx> Iterator for Elaborator<'cx, 'gcx, 'tcx> {
     type Item = ty::Predicate<'tcx>;
 
     fn next(&mut self) -> Option<ty::Predicate<'tcx>> {
@@ -203,18 +249,18 @@ impl<'cx, 'tcx> Iterator for Elaborator<'cx, 'tcx> {
 // Supertrait iterator
 ///////////////////////////////////////////////////////////////////////////
 
-pub type Supertraits<'cx, 'tcx> = FilterToTraits<Elaborator<'cx, 'tcx>>;
+pub type Supertraits<'cx, 'gcx, 'tcx> = FilterToTraits<Elaborator<'cx, 'gcx, 'tcx>>;
 
-pub fn supertraits<'cx, 'tcx>(tcx: &'cx TyCtxt<'tcx>,
-                              trait_ref: ty::PolyTraitRef<'tcx>)
-                              -> Supertraits<'cx, 'tcx>
+pub fn supertraits<'cx, 'gcx, 'tcx>(tcx: TyCtxt<'cx, 'gcx, 'tcx>,
+                                    trait_ref: ty::PolyTraitRef<'tcx>)
+                                    -> Supertraits<'cx, 'gcx, 'tcx>
 {
     elaborate_trait_ref(tcx, trait_ref).filter_to_traits()
 }
 
-pub fn transitive_bounds<'cx, 'tcx>(tcx: &'cx TyCtxt<'tcx>,
-                                    bounds: &[ty::PolyTraitRef<'tcx>])
-                                    -> Supertraits<'cx, 'tcx>
+pub fn transitive_bounds<'cx, 'gcx, 'tcx>(tcx: TyCtxt<'cx, 'gcx, 'tcx>,
+                                          bounds: &[ty::PolyTraitRef<'tcx>])
+                                          -> Supertraits<'cx, 'gcx, 'tcx>
 {
     elaborate_trait_refs(tcx, bounds).filter_to_traits()
 }
@@ -222,15 +268,15 @@ pub fn transitive_bounds<'cx, 'tcx>(tcx: &'cx TyCtxt<'tcx>,
 ///////////////////////////////////////////////////////////////////////////
 // Iterator over def-ids of supertraits
 
-pub struct SupertraitDefIds<'cx, 'tcx:'cx> {
-    tcx: &'cx TyCtxt<'tcx>,
+pub struct SupertraitDefIds<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+    tcx: TyCtxt<'a, 'gcx, 'tcx>,
     stack: Vec<DefId>,
-    visited: FnvHashSet<DefId>,
+    visited: FxHashSet<DefId>,
 }
 
-pub fn supertrait_def_ids<'cx, 'tcx>(tcx: &'cx TyCtxt<'tcx>,
-                                     trait_def_id: DefId)
-                                     -> SupertraitDefIds<'cx, 'tcx>
+pub fn supertrait_def_ids<'cx, 'gcx, 'tcx>(tcx: TyCtxt<'cx, 'gcx, 'tcx>,
+                                           trait_def_id: DefId)
+                                           -> SupertraitDefIds<'cx, 'gcx, 'tcx>
 {
     SupertraitDefIds {
         tcx: tcx,
@@ -239,7 +285,7 @@ pub fn supertrait_def_ids<'cx, 'tcx>(tcx: &'cx TyCtxt<'tcx>,
     }
 }
 
-impl<'cx, 'tcx> Iterator for SupertraitDefIds<'cx, 'tcx> {
+impl<'cx, 'gcx, 'tcx> Iterator for SupertraitDefIds<'cx, 'gcx, 'tcx> {
     type Item = DefId;
 
     fn next(&mut self) -> Option<DefId> {
@@ -248,7 +294,7 @@ impl<'cx, 'tcx> Iterator for SupertraitDefIds<'cx, 'tcx> {
             None => { return None; }
         };
 
-        let predicates = self.tcx.lookup_super_predicates(def_id);
+        let predicates = self.tcx.item_super_predicates(def_id);
         let visited = &mut self.visited;
         self.stack.extend(
             predicates.predicates
@@ -302,11 +348,11 @@ impl<'tcx,I:Iterator<Item=ty::Predicate<'tcx>>> Iterator for FilterToTraits<I> {
 /// Instantiate all bound parameters of the impl with the given substs,
 /// returning the resulting trait ref and all obligations that arise.
 /// The obligations are closed under normalization.
-pub fn impl_trait_ref_and_oblig<'a,'tcx>(selcx: &mut SelectionContext<'a,'tcx>,
-                                         impl_def_id: DefId,
-                                         impl_substs: &Substs<'tcx>)
-                                         -> (ty::TraitRef<'tcx>,
-                                             Vec<PredicateObligation<'tcx>>)
+pub fn impl_trait_ref_and_oblig<'a, 'gcx, 'tcx>(selcx: &mut SelectionContext<'a, 'gcx, 'tcx>,
+                                                impl_def_id: DefId,
+                                                impl_substs: &Substs<'tcx>)
+                                                -> (ty::TraitRef<'tcx>,
+                                                    Vec<PredicateObligation<'tcx>>)
 {
     let impl_trait_ref =
         selcx.tcx().impl_trait_ref(impl_def_id).unwrap();
@@ -315,7 +361,7 @@ pub fn impl_trait_ref_and_oblig<'a,'tcx>(selcx: &mut SelectionContext<'a,'tcx>,
     let Normalized { value: impl_trait_ref, obligations: normalization_obligations1 } =
         super::normalize(selcx, ObligationCause::dummy(), &impl_trait_ref);
 
-    let predicates = selcx.tcx().lookup_predicates(impl_def_id);
+    let predicates = selcx.tcx().item_predicates(impl_def_id);
     let predicates = predicates.instantiate(selcx.tcx(), impl_substs);
     let Normalized { value: predicates, obligations: normalization_obligations2 } =
         super::normalize(selcx, ObligationCause::dummy(), &predicates);
@@ -329,20 +375,6 @@ pub fn impl_trait_ref_and_oblig<'a,'tcx>(selcx: &mut SelectionContext<'a,'tcx>,
         .collect();
 
     (impl_trait_ref, impl_obligations)
-}
-
-// determine the `self` type, using fresh variables for all variables
-// declared on the impl declaration e.g., `impl<A,B> for Box<[(A,B)]>`
-// would return ($0, $1) where $0 and $1 are freshly instantiated type
-// variables.
-pub fn fresh_type_vars_for_impl<'a, 'tcx>(infcx: &InferCtxt<'a, 'tcx>,
-                                          span: Span,
-                                          impl_def_id: DefId)
-                                          -> Substs<'tcx>
-{
-    let tcx = infcx.tcx;
-    let impl_generics = tcx.lookup_item_type(impl_def_id).generics;
-    infcx.fresh_substs_for_generics(span, &impl_generics)
 }
 
 /// See `super::obligations_for_generics`
@@ -361,26 +393,6 @@ pub fn predicates_for_generics<'tcx>(cause: ObligationCause<'tcx>,
     }).collect()
 }
 
-pub fn trait_ref_for_builtin_bound<'tcx>(
-    tcx: &TyCtxt<'tcx>,
-    builtin_bound: ty::BuiltinBound,
-    param_ty: Ty<'tcx>)
-    -> Result<ty::TraitRef<'tcx>, ErrorReported>
-{
-    match tcx.lang_items.from_builtin_kind(builtin_bound) {
-        Ok(def_id) => {
-            Ok(ty::TraitRef {
-                def_id: def_id,
-                substs: tcx.mk_substs(Substs::empty().with_self_ty(param_ty))
-            })
-        }
-        Err(e) => {
-            tcx.sess.err(&e);
-            Err(ErrorReported)
-        }
-    }
-}
-
 pub fn predicate_for_trait_ref<'tcx>(
     cause: ObligationCause<'tcx>,
     trait_ref: ty::TraitRef<'tcx>,
@@ -394,115 +406,97 @@ pub fn predicate_for_trait_ref<'tcx>(
     }
 }
 
-pub fn predicate_for_trait_def<'tcx>(
-    tcx: &TyCtxt<'tcx>,
-    cause: ObligationCause<'tcx>,
-    trait_def_id: DefId,
-    recursion_depth: usize,
-    param_ty: Ty<'tcx>,
-    ty_params: Vec<Ty<'tcx>>)
-    -> PredicateObligation<'tcx>
-{
-    let trait_ref = ty::TraitRef {
-        def_id: trait_def_id,
-        substs: tcx.mk_substs(Substs::new_trait(ty_params, vec![], param_ty))
-    };
-    predicate_for_trait_ref(cause, trait_ref, recursion_depth)
-}
-
-pub fn predicate_for_builtin_bound<'tcx>(
-    tcx: &TyCtxt<'tcx>,
-    cause: ObligationCause<'tcx>,
-    builtin_bound: ty::BuiltinBound,
-    recursion_depth: usize,
-    param_ty: Ty<'tcx>)
-    -> Result<PredicateObligation<'tcx>, ErrorReported>
-{
-    let trait_ref = trait_ref_for_builtin_bound(tcx, builtin_bound, param_ty)?;
-    Ok(predicate_for_trait_ref(cause, trait_ref, recursion_depth))
-}
-
-/// Cast a trait reference into a reference to one of its super
-/// traits; returns `None` if `target_trait_def_id` is not a
-/// supertrait.
-pub fn upcast<'tcx>(tcx: &TyCtxt<'tcx>,
-                    source_trait_ref: ty::PolyTraitRef<'tcx>,
-                    target_trait_def_id: DefId)
-                    -> Vec<ty::PolyTraitRef<'tcx>>
-{
-    if source_trait_ref.def_id() == target_trait_def_id {
-        return vec![source_trait_ref]; // shorcut the most common case
+impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
+    pub fn predicate_for_trait_def(self,
+        cause: ObligationCause<'tcx>,
+        trait_def_id: DefId,
+        recursion_depth: usize,
+        param_ty: Ty<'tcx>,
+        ty_params: &[Ty<'tcx>])
+        -> PredicateObligation<'tcx>
+    {
+        let trait_ref = ty::TraitRef {
+            def_id: trait_def_id,
+            substs: self.mk_substs_trait(param_ty, ty_params)
+        };
+        predicate_for_trait_ref(cause, trait_ref, recursion_depth)
     }
 
-    supertraits(tcx, source_trait_ref)
-        .filter(|r| r.def_id() == target_trait_def_id)
-        .collect()
-}
-
-/// Given a trait `trait_ref`, returns the number of vtable entries
-/// that come from `trait_ref`, excluding its supertraits. Used in
-/// computing the vtable base for an upcast trait of a trait object.
-pub fn count_own_vtable_entries<'tcx>(tcx: &TyCtxt<'tcx>,
-                                      trait_ref: ty::PolyTraitRef<'tcx>)
-                                      -> usize {
-    let mut entries = 0;
-    // Count number of methods and add them to the total offset.
-    // Skip over associated types and constants.
-    for trait_item in &tcx.trait_items(trait_ref.def_id())[..] {
-        if let ty::MethodTraitItem(_) = *trait_item {
-            entries += 1;
+    /// Cast a trait reference into a reference to one of its super
+    /// traits; returns `None` if `target_trait_def_id` is not a
+    /// supertrait.
+    pub fn upcast_choices(self,
+                          source_trait_ref: ty::PolyTraitRef<'tcx>,
+                          target_trait_def_id: DefId)
+                          -> Vec<ty::PolyTraitRef<'tcx>>
+    {
+        if source_trait_ref.def_id() == target_trait_def_id {
+            return vec![source_trait_ref]; // shorcut the most common case
         }
-    }
-    entries
-}
 
-/// Given an upcast trait object described by `object`, returns the
-/// index of the method `method_def_id` (which should be part of
-/// `object.upcast_trait_ref`) within the vtable for `object`.
-pub fn get_vtable_index_of_object_method<'tcx>(tcx: &TyCtxt<'tcx>,
-                                               object: &super::VtableObjectData<'tcx>,
-                                               method_def_id: DefId) -> usize {
-    // Count number of methods preceding the one we are selecting and
-    // add them to the total offset.
-    // Skip over associated types and constants.
-    let mut entries = object.vtable_base;
-    for trait_item in &tcx.trait_items(object.upcast_trait_ref.def_id())[..] {
-        if trait_item.def_id() == method_def_id {
-            // The item with the ID we were given really ought to be a method.
-            assert!(match *trait_item {
-                ty::MethodTraitItem(_) => true,
-                _ => false
-            });
-
-            return entries;
-        }
-        if let ty::MethodTraitItem(_) = *trait_item {
-            entries += 1;
-        }
+        supertraits(self, source_trait_ref)
+            .filter(|r| r.def_id() == target_trait_def_id)
+            .collect()
     }
 
-    tcx.sess.bug(&format!("get_vtable_index_of_object_method: {:?} was not found",
-                          method_def_id));
+    /// Given a trait `trait_ref`, returns the number of vtable entries
+    /// that come from `trait_ref`, excluding its supertraits. Used in
+    /// computing the vtable base for an upcast trait of a trait object.
+    pub fn count_own_vtable_entries(self, trait_ref: ty::PolyTraitRef<'tcx>) -> usize {
+        let mut entries = 0;
+        // Count number of methods and add them to the total offset.
+        // Skip over associated types and constants.
+        for trait_item in self.associated_items(trait_ref.def_id()) {
+            if trait_item.kind == ty::AssociatedKind::Method {
+                entries += 1;
+            }
+        }
+        entries
+    }
+
+    /// Given an upcast trait object described by `object`, returns the
+    /// index of the method `method_def_id` (which should be part of
+    /// `object.upcast_trait_ref`) within the vtable for `object`.
+    pub fn get_vtable_index_of_object_method<N>(self,
+                                                object: &super::VtableObjectData<'tcx, N>,
+                                                method_def_id: DefId) -> usize {
+        // Count number of methods preceding the one we are selecting and
+        // add them to the total offset.
+        // Skip over associated types and constants.
+        let mut entries = object.vtable_base;
+        for trait_item in self.associated_items(object.upcast_trait_ref.def_id()) {
+            if trait_item.def_id == method_def_id {
+                // The item with the ID we were given really ought to be a method.
+                assert_eq!(trait_item.kind, ty::AssociatedKind::Method);
+                return entries;
+            }
+            if trait_item.kind == ty::AssociatedKind::Method {
+                entries += 1;
+            }
+        }
+
+        bug!("get_vtable_index_of_object_method: {:?} was not found",
+             method_def_id);
+    }
+
+    pub fn closure_trait_ref_and_return_type(self,
+        fn_trait_def_id: DefId,
+        self_ty: Ty<'tcx>,
+        sig: ty::PolyFnSig<'tcx>,
+        tuple_arguments: TupleArgumentsFlag)
+        -> ty::Binder<(ty::TraitRef<'tcx>, Ty<'tcx>)>
+    {
+        let arguments_tuple = match tuple_arguments {
+            TupleArgumentsFlag::No => sig.skip_binder().inputs()[0],
+            TupleArgumentsFlag::Yes =>
+                self.intern_tup(sig.skip_binder().inputs(), false),
+        };
+        let trait_ref = ty::TraitRef {
+            def_id: fn_trait_def_id,
+            substs: self.mk_substs_trait(self_ty, &[arguments_tuple]),
+        };
+        ty::Binder((trait_ref, sig.skip_binder().output()))
+    }
 }
 
 pub enum TupleArgumentsFlag { Yes, No }
-
-pub fn closure_trait_ref_and_return_type<'tcx>(
-    tcx: &TyCtxt<'tcx>,
-    fn_trait_def_id: DefId,
-    self_ty: Ty<'tcx>,
-    sig: &ty::PolyFnSig<'tcx>,
-    tuple_arguments: TupleArgumentsFlag)
-    -> ty::Binder<(ty::TraitRef<'tcx>, Ty<'tcx>)>
-{
-    let arguments_tuple = match tuple_arguments {
-        TupleArgumentsFlag::No => sig.0.inputs[0],
-        TupleArgumentsFlag::Yes => tcx.mk_tup(sig.0.inputs.to_vec()),
-    };
-    let trait_substs = Substs::new_trait(vec![arguments_tuple], vec![], self_ty);
-    let trait_ref = ty::TraitRef {
-        def_id: fn_trait_def_id,
-        substs: tcx.mk_substs(trait_substs),
-    };
-    ty::Binder((trait_ref, sig.0.output.unwrap_or(tcx.mk_nil())))
-}

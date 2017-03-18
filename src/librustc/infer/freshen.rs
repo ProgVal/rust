@@ -23,7 +23,7 @@
 //! error messages or in any other form. Freshening is only really useful as an internal detail.
 //!
 //! __An important detail concerning regions.__ The freshener also replaces *all* regions with
-//! 'static. The reason behind this is that, in general, we do not take region relationships into
+//! 'erased. The reason behind this is that, in general, we do not take region relationships into
 //! account when making type-overloaded decisions. This is important because of the design of the
 //! region inferencer, which is not based on unification but rather on accumulating and then
 //! solving a set of constraints. In contrast, the type inferencer assigns a value to each type
@@ -32,23 +32,25 @@
 
 use ty::{self, Ty, TyCtxt, TypeFoldable};
 use ty::fold::TypeFolder;
-use std::collections::hash_map::{self, Entry};
+use util::nodemap::FxHashMap;
+use std::collections::hash_map::Entry;
 
 use super::InferCtxt;
 use super::unify_key::ToType;
 
-pub struct TypeFreshener<'a, 'tcx:'a> {
-    infcx: &'a InferCtxt<'a, 'tcx>,
+pub struct TypeFreshener<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+    infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
     freshen_count: u32,
-    freshen_map: hash_map::HashMap<ty::InferTy, Ty<'tcx>>,
+    freshen_map: FxHashMap<ty::InferTy, Ty<'tcx>>,
 }
 
-impl<'a, 'tcx> TypeFreshener<'a, 'tcx> {
-    pub fn new(infcx: &'a InferCtxt<'a, 'tcx>) -> TypeFreshener<'a, 'tcx> {
+impl<'a, 'gcx, 'tcx> TypeFreshener<'a, 'gcx, 'tcx> {
+    pub fn new(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>)
+               -> TypeFreshener<'a, 'gcx, 'tcx> {
         TypeFreshener {
             infcx: infcx,
             freshen_count: 0,
-            freshen_map: hash_map::HashMap::new(),
+            freshen_map: FxHashMap(),
         }
     }
 
@@ -59,9 +61,8 @@ impl<'a, 'tcx> TypeFreshener<'a, 'tcx> {
                   -> Ty<'tcx> where
         F: FnOnce(u32) -> ty::InferTy,
     {
-        match opt_ty {
-            Some(ty) => { return ty.fold_with(self); }
-            None => { }
+        if let Some(ty) = opt_ty {
+            return ty.fold_with(self);
         }
 
         match self.freshen_map.entry(key) {
@@ -77,13 +78,13 @@ impl<'a, 'tcx> TypeFreshener<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> TypeFolder<'tcx> for TypeFreshener<'a, 'tcx> {
-    fn tcx<'b>(&'b self) -> &'b TyCtxt<'tcx> {
+impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
+    fn tcx<'b>(&'b self) -> TyCtxt<'b, 'gcx, 'tcx> {
         self.infcx.tcx
     }
 
-    fn fold_region(&mut self, r: ty::Region) -> ty::Region {
-        match r {
+    fn fold_region(&mut self, r: &'tcx ty::Region) -> &'tcx ty::Region {
+        match *r {
             ty::ReEarlyBound(..) |
             ty::ReLateBound(..) => {
                 // leave bound regions alone
@@ -95,9 +96,10 @@ impl<'a, 'tcx> TypeFolder<'tcx> for TypeFreshener<'a, 'tcx> {
             ty::ReScope(_) |
             ty::ReVar(_) |
             ty::ReSkolemized(..) |
-            ty::ReEmpty => {
-                // replace all free regions with 'static
-                ty::ReStatic
+            ty::ReEmpty |
+            ty::ReErased => {
+                // replace all free regions with 'erased
+                self.tcx().mk_region(ty::ReErased)
             }
         }
     }
@@ -140,11 +142,10 @@ impl<'a, 'tcx> TypeFolder<'tcx> for TypeFreshener<'a, 'tcx> {
             ty::TyInfer(ty::FreshIntTy(c)) |
             ty::TyInfer(ty::FreshFloatTy(c)) => {
                 if c >= self.freshen_count {
-                    tcx.sess.bug(
-                        &format!("Encountered a freshend type with id {} \
-                                  but our counter is only at {}",
-                                 c,
-                                 self.freshen_count));
+                    bug!("Encountered a freshend type with id {} \
+                          but our counter is only at {}",
+                         c,
+                         self.freshen_count);
                 }
                 t
             }
@@ -154,8 +155,7 @@ impl<'a, 'tcx> TypeFolder<'tcx> for TypeFreshener<'a, 'tcx> {
             ty::TyInt(..) |
             ty::TyUint(..) |
             ty::TyFloat(..) |
-            ty::TyEnum(..) |
-            ty::TyBox(..) |
+            ty::TyAdt(..) |
             ty::TyStr |
             ty::TyError |
             ty::TyArray(..) |
@@ -164,12 +164,13 @@ impl<'a, 'tcx> TypeFolder<'tcx> for TypeFreshener<'a, 'tcx> {
             ty::TyRef(..) |
             ty::TyFnDef(..) |
             ty::TyFnPtr(_) |
-            ty::TyTrait(..) |
-            ty::TyStruct(..) |
+            ty::TyDynamic(..) |
             ty::TyClosure(..) |
+            ty::TyNever |
             ty::TyTuple(..) |
             ty::TyProjection(..) |
-            ty::TyParam(..) => {
+            ty::TyParam(..) |
+            ty::TyAnon(..) => {
                 t.super_fold_with(self)
             }
         }

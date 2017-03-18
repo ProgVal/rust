@@ -19,28 +19,32 @@ fn a() {
         [box ref _a, _, _] => {
         //~^ borrow of `vec[..]` occurs here
             vec[0] = box 4; //~ ERROR cannot assign
+            //~^ assignment to borrowed `vec[..]` occurs here
         }
     }
 }
 
 fn b() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
-        [_b..] => {
+        &mut [ref _b..] => {
         //~^ borrow of `vec[..]` occurs here
             vec[0] = box 4; //~ ERROR cannot assign
+            //~^ assignment to borrowed `vec[..]` occurs here
         }
     }
 }
 
 fn c() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
-        [_a,         //~ ERROR cannot move out
-         _b..] => {  //~^ NOTE attempting to move value to here
-
+        &mut [_a, //~ ERROR cannot move out
+            //~| cannot move out
+            //~| to prevent move
+            ..
+        ] => {
             // Note: `_a` is *moved* here, but `b` is borrowing,
             // hence illegal.
             //
@@ -50,33 +54,38 @@ fn c() {
         _ => {}
     }
     let a = vec[0]; //~ ERROR cannot move out
-    //~^ NOTE attempting to move value to here
+    //~^ NOTE to prevent move
+    //~| cannot move out of here
 }
 
 fn d() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
-        [_a..,     //~ ERROR cannot move out
-         _b] => {} //~ NOTE attempting to move value to here
+        &mut [ //~ ERROR cannot move out
+        //~^ cannot move out
+         _b] => {} //~ NOTE to prevent move
         _ => {}
     }
     let a = vec[0]; //~ ERROR cannot move out
-    //~^ NOTE attempting to move value to here
+    //~^ NOTE to prevent move
+    //~| cannot move out of here
 }
 
 fn e() {
-    let mut vec = vec!(box 1, box 2, box 3);
+    let mut vec = vec![box 1, box 2, box 3];
     let vec: &mut [Box<isize>] = &mut vec;
     match vec {
-        [_a, _b, _c] => {}  //~ ERROR cannot move out
-        //~^ NOTE attempting to move value to here
-        //~^^ NOTE and here
-        //~^^^ NOTE and here
+        &mut [_a, _b, _c] => {}  //~ ERROR cannot move out
+        //~| cannot move out
+        //~| NOTE to prevent move
+        //~| NOTE and here
+        //~| NOTE and here
         _ => {}
     }
     let a = vec[0]; //~ ERROR cannot move out
-    //~^ NOTE attempting to move value to here
+    //~^ NOTE to prevent move
+    //~| cannot move out of here
 }
 
 fn main() {}

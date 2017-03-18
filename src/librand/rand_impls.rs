@@ -144,9 +144,8 @@ impl Rand for char {
             // Rejection sampling. About 0.2% of numbers with at most
             // 21-bits are invalid codepoints (surrogates), so this
             // will succeed first go almost every time.
-            match char::from_u32(rng.next_u32() & CHAR_MASK) {
-                Some(c) => return c,
-                None => {}
+            if let Some(c) = char::from_u32(rng.next_u32() & CHAR_MASK) {
+                return c;
             }
         }
     }
@@ -204,10 +203,6 @@ tuple_impl!{A, B, C, D, E, F, G, H, I, J, K, L}
 impl<T: Rand> Rand for Option<T> {
     #[inline]
     fn rand<R: Rng>(rng: &mut R) -> Option<T> {
-        if rng.gen() {
-            Some(rng.gen())
-        } else {
-            None
-        }
+        if rng.gen() { Some(rng.gen()) } else { None }
     }
 }

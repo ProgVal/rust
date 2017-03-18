@@ -11,7 +11,7 @@
 // Test cases where a changing struct appears in the signature of fns
 // and methods.
 
-// compile-flags: -Z incr-comp
+// compile-flags: -Z query-dep-graph
 
 #![feature(rustc_attrs)]
 #![allow(dead_code)]
@@ -34,9 +34,11 @@ struct WontChange {
 mod signatures {
     use WillChange;
 
-    #[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
-    #[rustc_then_this_would_need(CollectItem)] //~ ERROR OK
+    #[rustc_then_this_would_need(ItemSignature)] //~ ERROR no path
+    #[rustc_then_this_would_need(CollectItem)] //~ ERROR no path
     trait Bar {
+        #[rustc_then_this_would_need(ItemSignature)] //~ ERROR OK
+        #[rustc_then_this_would_need(CollectItem)] //~ ERROR OK
         fn do_something(x: WillChange);
     }
 

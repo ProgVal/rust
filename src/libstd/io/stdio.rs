@@ -8,10 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use prelude::v1::*;
 use io::prelude::*;
 
-use cell::{RefCell, BorrowState};
+use cell::RefCell;
 use fmt;
 use io::lazy::Lazy;
 use io::{self, BufReader, LineWriter};
@@ -82,11 +81,11 @@ impl Read for StdinRaw {
 }
 impl Write for StdoutRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.0.write(buf) }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> { self.0.flush() }
 }
 impl Write for StderrRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.0.write(buf) }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> { self.0.flush() }
 }
 
 enum Maybe<T> {
@@ -126,13 +125,10 @@ impl<R: io::Read> io::Read for Maybe<R> {
 }
 
 fn handle_ebadf<T>(r: io::Result<T>, default: T) -> io::Result<T> {
-    #[cfg(windows)]
-    const ERR: i32 = ::sys::c::ERROR_INVALID_HANDLE as i32;
-    #[cfg(not(windows))]
-    const ERR: i32 = ::libc::EBADF as i32;
+    use sys::stdio::EBADF_ERR;
 
     match r {
-        Err(ref e) if e.raw_os_error() == Some(ERR) => Ok(default),
+        Err(ref e) if e.raw_os_error() == Some(EBADF_ERR) => Ok(default),
         r => r
     }
 }
@@ -186,7 +182,7 @@ pub struct StdinLock<'a> {
 ///
 /// # fn foo() -> io::Result<String> {
 /// let mut buffer = String::new();
-/// try!(io::stdin().read_to_string(&mut buffer));
+/// io::stdin().read_to_string(&mut buffer)?;
 /// # Ok(buffer)
 /// # }
 /// ```
@@ -201,7 +197,7 @@ pub struct StdinLock<'a> {
 /// let stdin = io::stdin();
 /// let mut handle = stdin.lock();
 ///
-/// try!(handle.read_to_string(&mut buffer));
+/// handle.read_to_string(&mut buffer)?;
 /// # Ok(buffer)
 /// # }
 /// ```
@@ -218,15 +214,7 @@ pub fn stdin() -> Stdin {
             _ => Maybe::Fake
         };
 
-        // The default buffer capacity is 64k, but apparently windows
-        // doesn't like 64k reads on stdin. See #13304 for details, but the
-        // idea is that on windows we use a slightly smaller buffer that's
-        // been seen to be acceptable.
-        Arc::new(Mutex::new(if cfg!(windows) {
-            BufReader::with_capacity(8 * 1024, stdin)
-        } else {
-            BufReader::new(stdin)
-        }))
+        Arc::new(Mutex::new(BufReader::with_capacity(stdio::STDIN_BUF_SIZE, stdin)))
     }
 }
 
@@ -240,6 +228,21 @@ impl Stdin {
     ///
     /// [`Read`]: trait.Read.html
     /// [`BufRead`]: trait.BufRead.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{self, Read};
+    ///
+    /// # fn foo() -> io::Result<String> {
+    /// let mut buffer = String::new();
+    /// let stdin = io::stdin();
+    /// let mut handle = stdin.lock();
+    ///
+    /// handle.read_to_string(&mut buffer)?;
+    /// # Ok(buffer)
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> StdinLock {
         StdinLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
@@ -279,6 +282,13 @@ impl Stdin {
     }
 }
 
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for Stdin {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("Stdin { .. }")
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Read for Stdin {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -311,14 +321,22 @@ impl<'a> BufRead for StdinLock<'a> {
     fn consume(&mut self, n: usize) { self.inner.consume(n) }
 }
 
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl<'a> fmt::Debug for StdinLock<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("StdinLock { .. }")
+    }
+}
+
 /// A handle to the global standard output stream of the current process.
 ///
 /// Each handle shares a global buffer of data to be written to the standard
 /// output stream. Access is also synchronized via a lock and explicit control
-/// over locking is available via the `lock` method.
+/// over locking is available via the [`lock`] method.
 ///
 /// Created by the [`io::stdout`] method.
 ///
+/// [`lock`]: #method.lock
 /// [`io::stdout`]: fn.stdout.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stdout {
@@ -356,7 +374,7 @@ pub struct StdoutLock<'a> {
 /// use std::io::{self, Write};
 ///
 /// # fn foo() -> io::Result<()> {
-/// try!(io::stdout().write(b"hello world"));
+/// io::stdout().write(b"hello world")?;
 ///
 /// # Ok(())
 /// # }
@@ -371,7 +389,7 @@ pub struct StdoutLock<'a> {
 /// let stdout = io::stdout();
 /// let mut handle = stdout.lock();
 ///
-/// try!(handle.write(b"hello world"));
+/// handle.write(b"hello world")?;
 ///
 /// # Ok(())
 /// # }
@@ -399,9 +417,31 @@ impl Stdout {
     ///
     /// The lock is released when the returned lock goes out of scope. The
     /// returned guard also implements the `Write` trait for writing data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{self, Write};
+    ///
+    /// # fn foo() -> io::Result<()> {
+    /// let stdout = io::stdout();
+    /// let mut handle = stdout.lock();
+    ///
+    /// handle.write(b"hello world")?;
+    ///
+    /// # Ok(())
+    /// # }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> StdoutLock {
         StdoutLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
+    }
+}
+
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for Stdout {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("Stdout { .. }")
     }
 }
 
@@ -427,6 +467,13 @@ impl<'a> Write for StdoutLock<'a> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.inner.borrow_mut().flush()
+    }
+}
+
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl<'a> fmt::Debug for StdoutLock<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("StdoutLock { .. }")
     }
 }
 
@@ -463,7 +510,7 @@ pub struct StderrLock<'a> {
 /// use std::io::{self, Write};
 ///
 /// # fn foo() -> io::Result<()> {
-/// try!(io::stderr().write(b"hello world"));
+/// io::stderr().write(b"hello world")?;
 ///
 /// # Ok(())
 /// # }
@@ -478,7 +525,7 @@ pub struct StderrLock<'a> {
 /// let stderr = io::stderr();
 /// let mut handle = stderr.lock();
 ///
-/// try!(handle.write(b"hello world"));
+/// handle.write(b"hello world")?;
 ///
 /// # Ok(())
 /// # }
@@ -505,9 +552,31 @@ impl Stderr {
     ///
     /// The lock is released when the returned lock goes out of scope. The
     /// returned guard also implements the `Write` trait for writing data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::{self, Write};
+    ///
+    /// fn foo() -> io::Result<()> {
+    ///     let stderr = io::stderr();
+    ///     let mut handle = stderr.lock();
+    ///
+    ///     handle.write(b"hello world")?;
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> StderrLock {
         StderrLock { inner: self.inner.lock().unwrap_or_else(|e| e.into_inner()) }
+    }
+}
+
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for Stderr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("Stderr { .. }")
     }
 }
 
@@ -536,6 +605,13 @@ impl<'a> Write for StderrLock<'a> {
     }
 }
 
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl<'a> fmt::Debug for StderrLock<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("StderrLock { .. }")
+    }
+}
+
 /// Resets the thread-local stderr handle to the specified writer
 ///
 /// This will replace the current thread's stderr handle, returning the old
@@ -549,11 +625,11 @@ impl<'a> Write for StderrLock<'a> {
                      with a more general mechanism",
            issue = "0")]
 #[doc(hidden)]
-pub fn set_panic(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
+pub fn set_panic(sink: Option<Box<Write + Send>>) -> Option<Box<Write + Send>> {
     use panicking::LOCAL_STDERR;
     use mem;
     LOCAL_STDERR.with(move |slot| {
-        mem::replace(&mut *slot.borrow_mut(), Some(sink))
+        mem::replace(&mut *slot.borrow_mut(), sink)
     }).and_then(|mut s| {
         let _ = s.flush();
         Some(s)
@@ -573,10 +649,10 @@ pub fn set_panic(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
                      with a more general mechanism",
            issue = "0")]
 #[doc(hidden)]
-pub fn set_print(sink: Box<Write + Send>) -> Option<Box<Write + Send>> {
+pub fn set_print(sink: Option<Box<Write + Send>>) -> Option<Box<Write + Send>> {
     use mem;
     LOCAL_STDOUT.with(move |slot| {
-        mem::replace(&mut *slot.borrow_mut(), Some(sink))
+        mem::replace(&mut *slot.borrow_mut(), sink)
     }).and_then(|mut s| {
         let _ = s.flush();
         Some(s)
@@ -604,8 +680,8 @@ pub fn _print(args: fmt::Arguments) {
         LocalKeyState::Destroyed => stdout().write_fmt(args),
         LocalKeyState::Valid => {
             LOCAL_STDOUT.with(|s| {
-                if s.borrow_state() == BorrowState::Unused {
-                    if let Some(w) = s.borrow_mut().as_mut() {
+                if let Ok(mut borrowed) = s.try_borrow_mut() {
+                    if let Some(w) = borrowed.as_mut() {
                         return w.write_fmt(args);
                     }
                 }
@@ -624,6 +700,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(target_os = "emscripten", ignore)]
     fn panic_doesnt_poison() {
         thread::spawn(|| {
             let _a = stdin();

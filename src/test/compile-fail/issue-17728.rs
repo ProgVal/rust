@@ -116,7 +116,7 @@ fn str_to_direction(to_parse: &str) -> RoomDirection {
         "out" => RoomDirection::Out,
         "up" => RoomDirection::Up,
         "down" => RoomDirection::Down,
-        _ => None //~ NOTE match arm with an incompatible type
+        _ => None
     }
 }
 

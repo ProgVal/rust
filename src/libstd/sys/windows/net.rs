@@ -10,15 +10,11 @@
 
 #![unstable(issue = "0", feature = "windows_net")]
 
-use prelude::v1::*;
-
 use cmp;
 use io::{self, Read};
 use libc::{c_int, c_void, c_ulong};
 use mem;
 use net::{SocketAddr, Shutdown};
-use num::One;
-use ops::Neg;
 use ptr;
 use sync::Once;
 use sys::c;
@@ -60,11 +56,26 @@ fn last_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { c::WSAGetLastError() })
 }
 
+#[doc(hidden)]
+pub trait IsMinusOne {
+    fn is_minus_one(&self) -> bool;
+}
+
+macro_rules! impl_is_minus_one {
+    ($($t:ident)*) => ($(impl IsMinusOne for $t {
+        fn is_minus_one(&self) -> bool {
+            *self == -1
+        }
+    })*)
+}
+
+impl_is_minus_one! { i8 i16 i32 i64 isize }
+
 /// Checks if the signed integer is the Windows constant `SOCKET_ERROR` (-1)
 /// and if so, returns the last error from the Windows socket interface. This
 /// function must be called before another call to the socket API is made.
-pub fn cvt<T: One + PartialEq + Neg<Output=T>>(t: T) -> io::Result<T> {
-    if t == -T::one() {
+pub fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
+    if t.is_minus_one() {
         Err(last_error())
     } else {
         Ok(t)
@@ -82,7 +93,8 @@ pub fn cvt_gai(err: c_int) -> io::Result<()> {
 
 /// Just to provide the same interface as sys/unix/net.rs
 pub fn cvt_r<T, F>(mut f: F) -> io::Result<T>
-    where T: One + PartialEq + Neg<Output=T>, F: FnMut() -> T
+    where T: IsMinusOne,
+          F: FnMut() -> T
 {
     cvt(f())
 }
@@ -135,17 +147,57 @@ impl Socket {
         Ok(socket)
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    fn recv_with_flags(&self, buf: &mut [u8], flags: c_int) -> io::Result<usize> {
         // On unix when a socket is shut down all further reads return 0, so we
         // do the same on windows to map a shut down socket to returning EOF.
         let len = cmp::min(buf.len(), i32::max_value() as usize) as i32;
         unsafe {
-            match c::recv(self.0, buf.as_mut_ptr() as *mut c_void, len, 0) {
+            match c::recv(self.0, buf.as_mut_ptr() as *mut c_void, len, flags) {
                 -1 if c::WSAGetLastError() == c::WSAESHUTDOWN => Ok(0),
                 -1 => Err(last_error()),
                 n => Ok(n as usize)
             }
         }
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with_flags(buf, 0)
+    }
+
+    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with_flags(buf, c::MSG_PEEK)
+    }
+
+    fn recv_from_with_flags(&self, buf: &mut [u8], flags: c_int)
+                            -> io::Result<(usize, SocketAddr)> {
+        let mut storage: c::SOCKADDR_STORAGE_LH = unsafe { mem::zeroed() };
+        let mut addrlen = mem::size_of_val(&storage) as c::socklen_t;
+        let len = cmp::min(buf.len(), <wrlen_t>::max_value() as usize) as wrlen_t;
+
+        // On unix when a socket is shut down all further reads return 0, so we
+        // do the same on windows to map a shut down socket to returning EOF.
+        unsafe {
+            match c::recvfrom(self.0,
+                              buf.as_mut_ptr() as *mut c_void,
+                              len,
+                              flags,
+                              &mut storage as *mut _ as *mut _,
+                              &mut addrlen) {
+                -1 if c::WSAGetLastError() == c::WSAESHUTDOWN => {
+                    Ok((0, net::sockaddr_to_addr(&storage, addrlen as usize)?))
+                },
+                -1 => Err(last_error()),
+                n => Ok((n as usize, net::sockaddr_to_addr(&storage, addrlen as usize)?)),
+            }
+        }
+    }
+
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from_with_flags(buf, 0)
+    }
+
+    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_from_with_flags(buf, c::MSG_PEEK)
     }
 
     pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {

@@ -134,6 +134,10 @@ to read from it. Similarly, reading from the `tcache` map for item `X`
 (which is a `DepTrackingMap`, described below) automatically invokes
 `dep_graph.read(ItemSignature(X))`.
 
+**Note:** adding `Hir` nodes requires a bit of caution due to the
+"inlining" that old trans and constant evaluation still use. See the
+section on inlining below.
+
 To make this strategy work, a certain amount of indirection is
 required. For example, modules in the HIR do not have direct pointers
 to the items that they contain. Rather, they contain node-ids -- one
@@ -322,20 +326,22 @@ The idea is that you can annotate a test like:
 #[rustc_if_this_changed]
 fn foo() { }
 
-#[rustc_then_this_would_need(TypeckItemBody)] //~ ERROR OK
+#[rustc_then_this_would_need(TypeckTables)] //~ ERROR OK
 fn bar() { foo(); }
 
-#[rustc_then_this_would_need(TypeckItemBody)] //~ ERROR no path
+#[rustc_then_this_would_need(TypeckTables)] //~ ERROR no path
 fn baz() { }
 ```
 
 This will check whether there is a path in the dependency graph from
-`Hir(foo)` to `TypeckItemBody(bar)`. An error is reported for each
+`Hir(foo)` to `TypeckTables(bar)`. An error is reported for each
 `#[rustc_then_this_would_need]` annotation that indicates whether a
 path exists. `//~ ERROR` annotations can then be used to test if a
 path is found (as demonstrated above).
 
 ### Debugging the dependency graph
+
+#### Dumping the graph
 
 The compiler is also capable of dumping the dependency graph for your
 debugging pleasure. To do so, pass the `-Z dump-dep-graph` flag. The
@@ -365,25 +371,54 @@ A node is considered to match a filter if all of those strings appear in its
 label. So, for example:
 
 ```
-RUST_DEP_GRAPH_FILTER='-> TypeckItemBody'
+RUST_DEP_GRAPH_FILTER='-> TypeckTables'
 ```
 
-would select the predecessors of all `TypeckItemBody` nodes. Usually though you
-want the `TypeckItemBody` node for some particular fn, so you might write:
+would select the predecessors of all `TypeckTables` nodes. Usually though you
+want the `TypeckTables` node for some particular fn, so you might write:
 
 ```
-RUST_DEP_GRAPH_FILTER='-> TypeckItemBody & bar'
+RUST_DEP_GRAPH_FILTER='-> TypeckTables & bar'
 ```
 
-This will select only the `TypeckItemBody` nodes for fns with `bar` in their name.
+This will select only the `TypeckTables` nodes for fns with `bar` in their name.
 
 Perhaps you are finding that when you change `foo` you need to re-type-check `bar`,
 but you don't think you should have to. In that case, you might do:
 
 ```
-RUST_DEP_GRAPH_FILTER='Hir&foo -> TypeckItemBody & bar'
+RUST_DEP_GRAPH_FILTER='Hir&foo -> TypeckTables & bar'
 ```
 
 This will dump out all the nodes that lead from `Hir(foo)` to
-`TypeckItemBody(bar)`, from which you can (hopefully) see the source
+`TypeckTables(bar)`, from which you can (hopefully) see the source
 of the erroneous edge.
+
+#### Tracking down incorrect edges
+
+Sometimes, after you dump the dependency graph, you will find some
+path that should not exist, but you will not be quite sure how it came
+to be. **When the compiler is built with debug assertions,** it can
+help you track that down. Simply set the `RUST_FORBID_DEP_GRAPH_EDGE`
+environment variable to a filter. Every edge created in the dep-graph
+will be tested against that filter -- if it matches, a `bug!` is
+reported, so you can easily see the backtrace (`RUST_BACKTRACE=1`).
+
+The syntax for these filters is the same as described in the previous
+section. However, note that this filter is applied to every **edge**
+and doesn't handle longer paths in the graph, unlike the previous
+section.
+
+Example:
+
+You find that there is a path from the `Hir` of `foo` to the type
+check of `bar` and you don't think there should be. You dump the
+dep-graph as described in the previous section and open `dep-graph.txt`
+to see something like:
+
+    Hir(foo) -> Collect(bar)
+    Collect(bar) -> TypeckTables(bar)
+    
+That first edge looks suspicious to you. So you set
+`RUST_FORBID_DEP_GRAPH_EDGE` to `Hir&foo -> Collect&bar`, re-run, and
+then observe the backtrace. Voila, bug fixed!

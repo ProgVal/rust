@@ -13,63 +13,59 @@
 
 use rustc::dep_graph::DepNode;
 use rustc::middle::expr_use_visitor as euv;
-use rustc::infer;
 use rustc::middle::mem_categorization as mc;
-use rustc::ty::{self, TyCtxt, ParameterEnvironment};
-use rustc::traits::ProjectionMode;
+use rustc::ty::{self, TyCtxt};
+use rustc::traits::Reveal;
 
-use rustc_front::hir;
-use rustc_front::intravisit;
+use rustc::hir;
+use rustc::hir::intravisit::{Visitor, NestedVisitorMap};
 use syntax::ast;
-use syntax::codemap::Span;
+use syntax_pos::Span;
 
-pub fn check_crate(tcx: &TyCtxt) {
+pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     let mut rvcx = RvalueContext { tcx: tcx };
-    tcx.visit_all_items_in_krate(DepNode::RvalueCheck, &mut rvcx);
+    tcx.visit_all_item_likes_in_krate(DepNode::RvalueCheck, &mut rvcx.as_deep_visitor());
 }
 
 struct RvalueContext<'a, 'tcx: 'a> {
-    tcx: &'a TyCtxt<'tcx>,
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
 }
 
-impl<'a, 'tcx, 'v> intravisit::Visitor<'v> for RvalueContext<'a, 'tcx> {
-    fn visit_fn(&mut self,
-                fk: intravisit::FnKind<'v>,
-                fd: &'v hir::FnDecl,
-                b: &'v hir::Block,
-                s: Span,
-                fn_id: ast::NodeId) {
-        {
-            // FIXME (@jroesch) change this to be an inference context
-            let param_env = ParameterEnvironment::for_item(self.tcx, fn_id);
-            let infcx = infer::new_infer_ctxt(self.tcx,
-                                              &self.tcx.tables,
-                                              Some(param_env.clone()),
-                                              ProjectionMode::AnyFinal);
-            let mut delegate = RvalueContextDelegate { tcx: self.tcx, param_env: &param_env };
-            let mut euv = euv::ExprUseVisitor::new(&mut delegate, &infcx);
-            euv.walk_fn(fd, b);
-        }
-        intravisit::walk_fn(self, fk, fd, b, s)
+impl<'a, 'tcx> Visitor<'tcx> for RvalueContext<'a, 'tcx> {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
+        NestedVisitorMap::None
+    }
+
+    fn visit_nested_body(&mut self, body_id: hir::BodyId) {
+        let body = self.tcx.hir.body(body_id);
+        self.tcx.infer_ctxt(body_id, Reveal::UserFacing).enter(|infcx| {
+            let mut delegate = RvalueContextDelegate {
+                tcx: infcx.tcx,
+                param_env: &infcx.parameter_environment
+            };
+            euv::ExprUseVisitor::new(&mut delegate, &infcx).consume_body(body);
+        });
+        self.visit_body(body);
     }
 }
 
-struct RvalueContextDelegate<'a, 'tcx: 'a> {
-    tcx: &'a TyCtxt<'tcx>,
-    param_env: &'a ty::ParameterEnvironment<'a,'tcx>,
+struct RvalueContextDelegate<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+    tcx: TyCtxt<'a, 'gcx, 'tcx>,
+    param_env: &'a ty::ParameterEnvironment<'gcx>,
 }
 
-impl<'a, 'tcx> euv::Delegate<'tcx> for RvalueContextDelegate<'a, 'tcx> {
+impl<'a, 'gcx, 'tcx> euv::Delegate<'tcx> for RvalueContextDelegate<'a, 'gcx, 'tcx> {
     fn consume(&mut self,
                _: ast::NodeId,
                span: Span,
                cmt: mc::cmt<'tcx>,
                _: euv::ConsumeMode) {
         debug!("consume; cmt: {:?}; type: {:?}", *cmt, cmt.ty);
-        if !cmt.ty.is_sized(self.param_env, span) {
+        let ty = self.tcx.lift_to_global(&cmt.ty).unwrap();
+        if !ty.is_sized(self.tcx.global_tcx(), self.param_env, span) {
             span_err!(self.tcx.sess, span, E0161,
                 "cannot move a value of type {0}: the size of {0} cannot be statically determined",
-                cmt.ty);
+                ty);
         }
     }
 
@@ -88,7 +84,7 @@ impl<'a, 'tcx> euv::Delegate<'tcx> for RvalueContextDelegate<'a, 'tcx> {
               _borrow_id: ast::NodeId,
               _borrow_span: Span,
               _cmt: mc::cmt,
-              _loan_region: ty::Region,
+              _loan_region: &'tcx ty::Region,
               _bk: ty::BorrowKind,
               _loan_cause: euv::LoanCause) {
     }

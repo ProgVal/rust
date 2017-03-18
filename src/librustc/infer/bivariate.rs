@@ -25,35 +25,40 @@
 //! In particular, it might be enough to say (A,B) are bivariant for
 //! all (A,B).
 
-use super::combine::{self, CombineFields};
+use super::combine::CombineFields;
 use super::type_variable::{BiTo};
 
 use ty::{self, Ty, TyCtxt};
 use ty::TyVar;
 use ty::relate::{Relate, RelateResult, TypeRelation};
 
-pub struct Bivariate<'a, 'tcx: 'a> {
-    fields: CombineFields<'a, 'tcx>
+pub struct Bivariate<'combine, 'infcx: 'combine, 'gcx: 'infcx+'tcx, 'tcx: 'infcx> {
+    fields: &'combine mut CombineFields<'infcx, 'gcx, 'tcx>,
+    a_is_expected: bool,
 }
 
-impl<'a, 'tcx> Bivariate<'a, 'tcx> {
-    pub fn new(fields: CombineFields<'a, 'tcx>) -> Bivariate<'a, 'tcx> {
-        Bivariate { fields: fields }
+impl<'combine, 'infcx, 'gcx, 'tcx> Bivariate<'combine, 'infcx, 'gcx, 'tcx> {
+    pub fn new(fields: &'combine mut CombineFields<'infcx, 'gcx, 'tcx>, a_is_expected: bool)
+        -> Bivariate<'combine, 'infcx, 'gcx, 'tcx>
+    {
+        Bivariate { fields: fields, a_is_expected: a_is_expected }
     }
 }
 
-impl<'a, 'tcx> TypeRelation<'a, 'tcx> for Bivariate<'a, 'tcx> {
+impl<'combine, 'infcx, 'gcx, 'tcx> TypeRelation<'infcx, 'gcx, 'tcx>
+    for Bivariate<'combine, 'infcx, 'gcx, 'tcx>
+{
     fn tag(&self) -> &'static str { "Bivariate" }
 
-    fn tcx(&self) -> &'a TyCtxt<'tcx> { self.fields.tcx() }
+    fn tcx(&self) -> TyCtxt<'infcx, 'gcx, 'tcx> { self.fields.tcx() }
 
-    fn a_is_expected(&self) -> bool { self.fields.a_is_expected }
+    fn a_is_expected(&self) -> bool { self.a_is_expected }
 
-    fn relate_with_variance<T:Relate<'a,'tcx>>(&mut self,
-                                               variance: ty::Variance,
-                                               a: &T,
-                                               b: &T)
-                                               -> RelateResult<'tcx, T>
+    fn relate_with_variance<T: Relate<'tcx>>(&mut self,
+                                             variance: ty::Variance,
+                                             a: &T,
+                                             b: &T)
+                                             -> RelateResult<'tcx, T>
     {
         match variance {
             // If we have Foo<A> and Foo is invariant w/r/t A,
@@ -86,28 +91,29 @@ impl<'a, 'tcx> TypeRelation<'a, 'tcx> for Bivariate<'a, 'tcx> {
             }
 
             (&ty::TyInfer(TyVar(a_id)), _) => {
-                self.fields.instantiate(b, BiTo, a_id)?;
+                self.fields.instantiate(b, BiTo, a_id, self.a_is_expected)?;
                 Ok(a)
             }
 
             (_, &ty::TyInfer(TyVar(b_id))) => {
-                self.fields.instantiate(a, BiTo, b_id)?;
+                self.fields.instantiate(a, BiTo, b_id, self.a_is_expected)?;
                 Ok(a)
             }
 
             _ => {
-                combine::super_combine_tys(self.fields.infcx, self, a, b)
+                self.fields.infcx.super_combine_tys(self, a, b)
             }
         }
     }
 
-    fn regions(&mut self, a: ty::Region, _: ty::Region) -> RelateResult<'tcx, ty::Region> {
+    fn regions(&mut self, a: &'tcx ty::Region, _: &'tcx ty::Region)
+               -> RelateResult<'tcx, &'tcx ty::Region> {
         Ok(a)
     }
 
     fn binders<T>(&mut self, a: &ty::Binder<T>, b: &ty::Binder<T>)
                   -> RelateResult<'tcx, ty::Binder<T>>
-        where T: Relate<'a,'tcx>
+        where T: Relate<'tcx>
     {
         let a1 = self.tcx().erase_late_bound_regions(a);
         let b1 = self.tcx().erase_late_bound_regions(b);

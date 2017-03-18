@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use middle::def_id::DefId;
+use hir::def_id::DefId;
 use ty::{self, Ty, TyCtxt};
 use syntax::ast;
 
@@ -22,14 +22,15 @@ pub enum SimplifiedType {
     IntSimplifiedType(ast::IntTy),
     UintSimplifiedType(ast::UintTy),
     FloatSimplifiedType(ast::FloatTy),
-    EnumSimplifiedType(DefId),
+    AdtSimplifiedType(DefId),
     StrSimplifiedType,
-    VecSimplifiedType,
+    ArraySimplifiedType,
     PtrSimplifiedType,
+    NeverSimplifiedType,
     TupleSimplifiedType(usize),
     TraitSimplifiedType(DefId),
-    StructSimplifiedType(DefId),
     ClosureSimplifiedType(DefId),
+    AnonSimplifiedType(DefId),
     FunctionSimplifiedType(usize),
     ParameterSimplifiedType,
 }
@@ -43,10 +44,10 @@ pub enum SimplifiedType {
 /// then we can't say much about whether two types would unify. Put another way,
 /// `can_simplify_params` should be true if type parameters appear free in `ty` and `false` if they
 /// are to be considered bound.
-pub fn simplify_type(tcx: &TyCtxt,
-                     ty: Ty,
-                     can_simplify_params: bool)
-                     -> Option<SimplifiedType>
+pub fn simplify_type<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
+                                     ty: Ty,
+                                     can_simplify_params: bool)
+                                     -> Option<SimplifiedType>
 {
     match ty.sty {
         ty::TyBool => Some(BoolSimplifiedType),
@@ -54,15 +55,12 @@ pub fn simplify_type(tcx: &TyCtxt,
         ty::TyInt(int_type) => Some(IntSimplifiedType(int_type)),
         ty::TyUint(uint_type) => Some(UintSimplifiedType(uint_type)),
         ty::TyFloat(float_type) => Some(FloatSimplifiedType(float_type)),
-        ty::TyEnum(def, _) => Some(EnumSimplifiedType(def.did)),
+        ty::TyAdt(def, _) => Some(AdtSimplifiedType(def.did)),
         ty::TyStr => Some(StrSimplifiedType),
-        ty::TyArray(..) | ty::TySlice(_) => Some(VecSimplifiedType),
+        ty::TyArray(..) | ty::TySlice(_) => Some(ArraySimplifiedType),
         ty::TyRawPtr(_) => Some(PtrSimplifiedType),
-        ty::TyTrait(ref trait_info) => {
-            Some(TraitSimplifiedType(trait_info.principal_def_id()))
-        }
-        ty::TyStruct(def, _) => {
-            Some(StructSimplifiedType(def.did))
+        ty::TyDynamic(ref trait_info, ..) => {
+            trait_info.principal().map(|p| TraitSimplifiedType(p.def_id()))
         }
         ty::TyRef(_, mt) => {
             // since we introduce auto-refs during method lookup, we
@@ -70,21 +68,15 @@ pub fn simplify_type(tcx: &TyCtxt,
             // view of possibly unifying
             simplify_type(tcx, mt.ty, can_simplify_params)
         }
-        ty::TyBox(_) => {
-            // treat like we would treat `Box`
-            match tcx.lang_items.require_owned_box() {
-                Ok(def_id) => Some(StructSimplifiedType(def_id)),
-                Err(msg) => tcx.sess.fatal(&msg),
-            }
-        }
         ty::TyClosure(def_id, _) => {
             Some(ClosureSimplifiedType(def_id))
         }
-        ty::TyTuple(ref tys) => {
+        ty::TyNever => Some(NeverSimplifiedType),
+        ty::TyTuple(ref tys, _) => {
             Some(TupleSimplifiedType(tys.len()))
         }
-        ty::TyFnDef(_, _, ref f) | ty::TyFnPtr(ref f) => {
-            Some(FunctionSimplifiedType(f.sig.0.inputs.len()))
+        ty::TyFnDef(.., ref f) | ty::TyFnPtr(ref f) => {
+            Some(FunctionSimplifiedType(f.skip_binder().inputs().len()))
         }
         ty::TyProjection(_) | ty::TyParam(_) => {
             if can_simplify_params {
@@ -97,6 +89,9 @@ pub fn simplify_type(tcx: &TyCtxt,
             } else {
                 None
             }
+        }
+        ty::TyAnon(def_id, _) => {
+            Some(AnonSimplifiedType(def_id))
         }
         ty::TyInfer(_) | ty::TyError => None,
     }

@@ -92,7 +92,6 @@
             reason = "internal routines only exposed for testing",
             issue = "0")]
 
-use prelude::v1::*;
 use fmt;
 use str::FromStr;
 
@@ -154,15 +153,15 @@ from_str_float_impl!(f64);
 /// for [`f32`] and [`f64`].
 ///
 /// [`FromStr`]: ../str/trait.FromStr.html
-/// [`f32`]: ../primitive.f32.html
-/// [`f64`]: ../primitive.f64.html
-#[derive(Debug, Clone, PartialEq)]
+/// [`f32`]: ../../std/primitive.f32.html
+/// [`f64`]: ../../std/primitive.f64.html
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct ParseFloatError {
     kind: FloatErrorKind
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FloatErrorKind {
     Empty,
     Invalid,
@@ -215,11 +214,11 @@ fn dec2flt<T: RawFloat>(s: &str) -> Result<T, ParseFloatError> {
     let (sign, s) = extract_sign(s);
     let flt = match parse_decimal(s) {
         ParseResult::Valid(decimal) => convert(decimal)?,
-        ParseResult::ShortcutToInf => T::infinity(),
-        ParseResult::ShortcutToZero => T::zero(),
+        ParseResult::ShortcutToInf => T::infinity2(),
+        ParseResult::ShortcutToZero => T::zero2(),
         ParseResult::Invalid => match s {
-            "inf" => T::infinity(),
-            "NaN" => T::nan(),
+            "inf" => T::infinity2(),
+            "NaN" => T::nan2(),
             _ => { return Err(pfe_invalid()); }
         }
     };
@@ -316,7 +315,7 @@ fn bound_intermediate_digits(decimal: &Decimal, e: i64) -> u64 {
 fn trivial_cases<T: RawFloat>(decimal: &Decimal) -> Option<T> {
     // There were zeros but they were stripped by simplify()
     if decimal.integral.is_empty() && decimal.fractional.is_empty() {
-        return Some(T::zero());
+        return Some(T::zero2());
     }
     // This is a crude approximation of ceil(log10(the real value)). We don't need to worry too
     // much about overflow here because the input length is tiny (at least compared to 2^64) and
@@ -324,9 +323,9 @@ fn trivial_cases<T: RawFloat>(decimal: &Decimal) -> Option<T> {
     // (which is still 10^19 short of 2^64).
     let max_place = decimal.exp + decimal.integral.len() as i64;
     if max_place > T::inf_cutoff() {
-        return Some(T::infinity());
+        return Some(T::infinity2());
     } else if max_place < T::zero_cutoff() {
-        return Some(T::zero());
+        return Some(T::zero2());
     }
     None
 }

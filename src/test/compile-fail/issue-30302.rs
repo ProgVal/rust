@@ -8,6 +8,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(non_snake_case)]
+#![deny(unreachable_patterns)]
+
 enum Stack<T> {
     Nil,
     Cons(T, Box<Stack<T>>)
@@ -18,10 +23,8 @@ fn is_empty<T>(s: Stack<T>) -> bool {
         Nil => true,
 //~^ WARN pattern binding `Nil` is named the same as one of the variants of the type `Stack`
 //~| HELP consider making the path in the pattern qualified: `Stack::Nil`
-//~| HELP run `rustc --explain E0170` to see a detailed explanation
         _ => false
 //~^ ERROR unreachable pattern
-//~| HELP run `rustc --explain E0001` to see a detailed explanation
     }
 }
 

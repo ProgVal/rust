@@ -9,29 +9,34 @@
 // except according to those terms.
 
 use super::{Target, TargetOptions};
+use super::emscripten_base::{cmd};
 
-pub fn target() -> Target {
+pub fn target() -> Result<Target, String> {
     let opts = TargetOptions {
-        linker: "emcc".to_string(),
-        ar: "emar".to_string(),
+        linker: cmd("emcc"),
+        ar: cmd("emar"),
 
         dynamic_linking: false,
         executables: true,
         exe_suffix: ".js".to_string(),
-        no_compiler_rt: true,
         linker_is_gnu: true,
         allow_asm: false,
         obj_is_bitcode: true,
+        is_like_emscripten: true,
+        max_atomic_width: Some(32),
+        post_link_args: vec!["-s".to_string(), "ERROR_ON_UNDEFINED_SYMBOLS=1".to_string()],
+        target_family: Some("unix".to_string()),
         .. Default::default()
     };
-    Target {
+    Ok(Target {
         llvm_target: "asmjs-unknown-emscripten".to_string(),
         target_endian: "little".to_string(),
         target_pointer_width: "32".to_string(),
         target_os: "emscripten".to_string(),
         target_env: "".to_string(),
         target_vendor: "unknown".to_string(),
+        data_layout: "e-p:32:32-i64:64-v128:32:128-n32-S128".to_string(),
         arch: "asmjs".to_string(),
         options: opts,
-    }
+    })
 }

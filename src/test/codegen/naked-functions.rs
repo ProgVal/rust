@@ -30,6 +30,7 @@ fn naked_empty() {
 fn naked_with_args(a: isize) {
     // CHECK: %a = alloca i{{[0-9]+}}
     // CHECK: ret void
+    &a; // keep variable in an alloca
 }
 
 // CHECK: Function Attrs: naked uwtable
@@ -48,6 +49,7 @@ fn naked_with_return() -> isize {
 fn naked_with_args_and_return(a: isize) -> isize {
     // CHECK: %a = alloca i{{[0-9]+}}
     // CHECK: ret i{{[0-9]+}} %{{[0-9]+}}
+    &a; // keep variable in an alloca
     a
 }
 

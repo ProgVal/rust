@@ -18,7 +18,7 @@ use syntax::ast::*;
 use syntax::attr::*;
 use syntax::ast;
 use syntax::parse;
-use syntax::parse::{ParseSess,filemap_to_tts, PResult};
+use syntax::parse::{ParseSess, PResult};
 use syntax::parse::new_parser_from_source_str;
 use syntax::parse::parser::Parser;
 use syntax::parse::token;
@@ -31,10 +31,7 @@ use std::fmt;
 // Copied out of syntax::util::parser_testing
 
 pub fn string_to_parser<'a>(ps: &'a ParseSess, source_str: String) -> Parser<'a> {
-    new_parser_from_source_str(ps,
-                               Vec::new(),
-                               "bogofile".to_string(),
-                               source_str)
+    new_parser_from_source_str(ps, "bogofile".to_string(), source_str)
 }
 
 fn with_error_checking_parse<'a, T, F>(s: String, ps: &'a ParseSess, f: F) -> PResult<'a, T> where
@@ -86,7 +83,7 @@ fn check_expr_attrs(es: &str, expected: &[&str]) {
     let actual = &e.attrs;
     str_compare(es,
                 &expected.iter().map(|r| attr(r, &ps).unwrap()).collect::<Vec<_>>(),
-                actual.as_attr_slice(),
+                &actual,
                 pprust::attribute_to_string);
 }
 

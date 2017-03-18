@@ -15,12 +15,10 @@
 use self::RegClass::*;
 
 use llvm::{Integer, Pointer, Float, Double};
-use llvm::{Struct, Array, Attribute, Vector};
-use abi::{ArgType, FnType};
+use llvm::{Struct, Array, Vector};
+use abi::{self, ArgType, ArgAttribute, FnType};
 use context::CrateContext;
 use type_::Type;
-
-use std::cmp;
 
 #[derive(Clone, Copy, PartialEq)]
 enum RegClass {
@@ -90,62 +88,11 @@ fn classify_ty(ty: Type) -> Vec<RegClass> {
     }
 
     fn ty_align(ty: Type) -> usize {
-        match ty.kind() {
-            Integer => ((ty.int_width() as usize) + 7) / 8,
-            Pointer => 8,
-            Float => 4,
-            Double => 8,
-            Struct => {
-              if ty.is_packed() {
-                1
-              } else {
-                let str_tys = ty.field_types();
-                str_tys.iter().fold(1, |a, t| cmp::max(a, ty_align(*t)))
-              }
-            }
-            Array => {
-                let elt = ty.element_type();
-                ty_align(elt)
-            }
-            Vector => {
-                let len = ty.vector_length();
-                let elt = ty.element_type();
-                ty_align(elt) * len
-            }
-            _ => panic!("ty_align: unhandled type")
-        }
+        abi::ty_align(ty, 8)
     }
 
     fn ty_size(ty: Type) -> usize {
-        match ty.kind() {
-            Integer => (ty.int_width() as usize + 7) / 8,
-            Pointer => 8,
-            Float => 4,
-            Double => 8,
-            Struct => {
-                let str_tys = ty.field_types();
-                if ty.is_packed() {
-                    str_tys.iter().fold(0, |s, t| s + ty_size(*t))
-                } else {
-                    let size = str_tys.iter().fold(0, |s, t| align(s, *t) + ty_size(*t));
-                    align(size, ty)
-                }
-            }
-            Array => {
-                let len = ty.array_length();
-                let elt = ty.element_type();
-                let eltsz = ty_size(elt);
-                len * eltsz
-            }
-            Vector => {
-                let len = ty.vector_length();
-                let elt = ty.element_type();
-                let eltsz = ty_size(elt);
-                len * eltsz
-            }
-
-            _ => panic!("ty_size: unhandled type")
-        }
+        abi::ty_size(ty, 8)
     }
 
     fn all_mem(cls: &mut [RegClass]) {
@@ -182,7 +129,7 @@ fn classify_ty(ty: Type) -> Vec<RegClass> {
             (SSEDs,       SSEUp) |
             (SSEInt(_),   SSEUp) => return,
 
-            (_,           _) => newv
+            (..) => newv
         };
         cls[i] = to_write;
     }
@@ -255,7 +202,7 @@ fn classify_ty(ty: Type) -> Vec<RegClass> {
                     Integer => SSEInt(elt.int_width()),
                     Float => SSEFv,
                     Double => SSEDv,
-                    _ => panic!("classify: unhandled vector element type")
+                    _ => bug!("classify: unhandled vector element type")
                 };
 
                 let mut i = 0;
@@ -268,7 +215,7 @@ fn classify_ty(ty: Type) -> Vec<RegClass> {
                     i += 1;
                 }
             }
-            _ => panic!("classify: unhandled type")
+            _ => bug!("classify: unhandled type")
         }
     }
 
@@ -357,7 +304,7 @@ fn llreg_ty(ccx: &CrateContext, cls: &[RegClass]) -> Type {
                                 "llreg_ty: unsupported SSEInt width {}", bits);
                         (64 / bits, Type::ix(ccx, bits))
                     }
-                    _ => unreachable!(),
+                    _ => bug!(),
                 };
                 let vec_len = llvec_len(&cls[i + 1..]);
                 let vec_ty = Type::vector(&elt_ty, vec_len as u64 * elts_per_word);
@@ -371,7 +318,7 @@ fn llreg_ty(ccx: &CrateContext, cls: &[RegClass]) -> Type {
             SSEDs => {
                 tys.push(Type::f64(ccx));
             }
-            _ => panic!("llregtype: unhandled class")
+            _ => bug!("llregtype: unhandled class")
         }
         i += 1;
     }
@@ -387,7 +334,7 @@ pub fn compute_abi_info(ccx: &CrateContext, fty: &mut FnType) {
     fn x86_64_ty<F>(ccx: &CrateContext,
                     arg: &mut ArgType,
                     is_mem_cls: F,
-                    ind_attr: Option<Attribute>)
+                    ind_attr: Option<ArgAttribute>)
         where F: FnOnce(&[RegClass]) -> bool
     {
         if !arg.ty.is_reg_ty() {
@@ -400,6 +347,8 @@ pub fn compute_abi_info(ccx: &CrateContext, fty: &mut FnType) {
             } else {
                 arg.cast = Some(llreg_ty(ccx, &cls));
             }
+        } else {
+            arg.extend_integer_width_to(32);
         }
     }
 
@@ -435,7 +384,7 @@ pub fn compute_abi_info(ccx: &CrateContext, fty: &mut FnType) {
                 sse_regs -= needed_sse;
             }
             in_mem
-        }, Some(Attribute::ByVal));
+        }, Some(ArgAttribute::ByVal));
 
         // An integer, pointer, double or float parameter
         // thus the above closure passed to `x86_64_ty` won't

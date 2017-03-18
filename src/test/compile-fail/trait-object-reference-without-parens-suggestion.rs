@@ -13,10 +13,10 @@ fn main() {
     //~^ ERROR expected a path
     //~| HELP try adding parentheses
     //~| SUGGESTION let _: &(Copy + 'static);
-    //~| HELP run `rustc --explain E0178` to see a detailed explanation
+    //~| ERROR at least one non-builtin trait is required for an object type
     let _: &'static Copy + 'static;
     //~^ ERROR expected a path
     //~| HELP try adding parentheses
     //~| SUGGESTION let _: &'static (Copy + 'static);
-    //~| HELP run `rustc --explain E0178` to see a detailed explanation
+    //~| ERROR at least one non-builtin trait is required for an object type
 }

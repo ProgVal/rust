@@ -25,475 +25,242 @@
 // by borrowck::gather_loans
 
 use rustc::dep_graph::DepNode;
-use rustc::ty::cast::{CastKind};
-use rustc::middle::const_eval::{self, ConstEvalErr};
-use rustc::middle::const_eval::ErrKind::IndexOpFeatureGated;
-use rustc::middle::const_eval::EvalHint::ExprTypeChecked;
-use rustc::middle::def::Def;
-use rustc::middle::def_id::DefId;
+use rustc::ty::cast::CastKind;
+use rustc_const_eval::{ConstEvalErr, ConstContext};
+use rustc_const_eval::ErrKind::{IndexOpFeatureGated, UnimplementedConstVal, MiscCatchAll, Math};
+use rustc_const_eval::ErrKind::{ErroneousReferencedConstant, MiscBinaryOp, NonConstPath};
+use rustc_const_eval::ErrKind::{TypeckError};
+use rustc_const_math::{ConstMathErr, Op};
+use rustc::hir::def::{Def, CtorKind};
+use rustc::hir::def_id::DefId;
+use rustc::hir::map::blocks::FnLikeNode;
 use rustc::middle::expr_use_visitor as euv;
-use rustc::infer;
 use rustc::middle::mem_categorization as mc;
 use rustc::middle::mem_categorization::Categorization;
+use rustc::mir::transform::MirSource;
 use rustc::ty::{self, Ty, TyCtxt};
-use rustc::traits::{self, ProjectionMode};
-use rustc::util::nodemap::NodeMap;
-use rustc::middle::const_qualif::ConstQualif;
+use rustc::traits::Reveal;
+use rustc::util::common::ErrorReported;
+use rustc::util::nodemap::NodeSet;
 use rustc::lint::builtin::CONST_ERR;
 
-use rustc_front::hir::{self, PatKind};
+use rustc::hir::{self, PatKind, RangeEnd};
 use syntax::ast;
-use syntax::codemap::Span;
-use syntax::feature_gate::UnstableFeatures;
-use rustc_front::intravisit::{self, FnKind, Visitor};
+use syntax_pos::Span;
+use rustc::hir::intravisit::{self, Visitor, NestedVisitorMap};
 
 use std::collections::hash_map::Entry;
 use std::cmp::Ordering;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Mode {
-    Const,
-    ConstFn,
-    Static,
-    StaticMut,
-
-    // An expression that occurs outside of any constant context
-    // (i.e. `const`, `static`, array lengths, etc.). The value
-    // can be variable at runtime, but will be promotable to
-    // static memory if we can prove it is actually constant.
-    Var,
-}
+use std::mem;
 
 struct CheckCrateVisitor<'a, 'tcx: 'a> {
-    tcx: &'a TyCtxt<'tcx>,
-    mode: Mode,
-    qualif: ConstQualif,
-    rvalue_borrows: NodeMap<hir::Mutability>
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    in_fn: bool,
+    promotable: bool,
+    mut_rvalue_borrows: NodeSet,
+    param_env: ty::ParameterEnvironment<'tcx>,
+    tables: &'a ty::TypeckTables<'tcx>,
 }
 
-impl<'a, 'tcx> CheckCrateVisitor<'a, 'tcx> {
-    fn with_mode<F, R>(&mut self, mode: Mode, f: F) -> R where
-        F: FnOnce(&mut CheckCrateVisitor<'a, 'tcx>) -> R,
-    {
-        let (old_mode, old_qualif) = (self.mode, self.qualif);
-        self.mode = mode;
-        self.qualif = ConstQualif::empty();
-        let r = f(self);
-        self.mode = old_mode;
-        self.qualif = old_qualif;
-        r
-    }
-
-    fn with_euv<'b, F, R>(&'b mut self, item_id: Option<ast::NodeId>, f: F) -> R where
-        F: for<'t> FnOnce(&mut euv::ExprUseVisitor<'b, 't, 'b, 'tcx>) -> R,
-    {
-        let param_env = match item_id {
-            Some(item_id) => ty::ParameterEnvironment::for_item(self.tcx, item_id),
-            None => self.tcx.empty_parameter_environment()
-        };
-
-        let infcx = infer::new_infer_ctxt(self.tcx,
-                                          &self.tcx.tables,
-                                          Some(param_env),
-                                          ProjectionMode::AnyFinal);
-
-        f(&mut euv::ExprUseVisitor::new(self, &infcx))
-    }
-
-    fn global_expr(&mut self, mode: Mode, expr: &hir::Expr) -> ConstQualif {
-        assert!(mode != Mode::Var);
-        match self.tcx.const_qualif_map.borrow_mut().entry(expr.id) {
-            Entry::Occupied(entry) => return *entry.get(),
-            Entry::Vacant(entry) => {
-                // Prevent infinite recursion on re-entry.
-                entry.insert(ConstQualif::empty());
-            }
-        }
-        self.with_mode(mode, |this| {
-            this.with_euv(None, |euv| euv.consume_expr(expr));
-            this.visit_expr(expr);
-            this.qualif
-        })
-    }
-
-    fn fn_like(&mut self,
-               fk: FnKind,
-               fd: &hir::FnDecl,
-               b: &hir::Block,
-               s: Span,
-               fn_id: ast::NodeId)
-               -> ConstQualif {
-        match self.tcx.const_qualif_map.borrow_mut().entry(fn_id) {
-            Entry::Occupied(entry) => return *entry.get(),
-            Entry::Vacant(entry) => {
-                // Prevent infinite recursion on re-entry.
-                entry.insert(ConstQualif::empty());
-            }
-        }
-
-        let mode = match fk {
-            FnKind::ItemFn(_, _, _, hir::Constness::Const, _, _, _) => {
-                Mode::ConstFn
-            }
-            FnKind::Method(_, m, _, _) => {
-                if m.constness == hir::Constness::Const {
-                    Mode::ConstFn
-                } else {
-                    Mode::Var
+impl<'a, 'gcx> CheckCrateVisitor<'a, 'gcx> {
+    fn check_const_eval(&self, expr: &'gcx hir::Expr) {
+        let const_cx = ConstContext::with_tables(self.tcx, self.tables);
+        if let Err(err) = const_cx.eval(expr) {
+            match err.kind {
+                UnimplementedConstVal(_) => {}
+                IndexOpFeatureGated => {}
+                ErroneousReferencedConstant(_) => {}
+                TypeckError => {}
+                _ => {
+                    self.tcx.sess.add_lint(CONST_ERR,
+                                           expr.id,
+                                           expr.span,
+                                           format!("constant evaluation error: {}. This will \
+                                                    become a HARD ERROR in the future",
+                                                   err.description().into_oneline()))
                 }
             }
-            _ => Mode::Var
+        }
+    }
+
+    // Adds the worst effect out of all the values of one type.
+    fn add_type(&mut self, ty: Ty<'gcx>) {
+        if ty.type_contents(self.tcx).interior_unsafe() {
+            self.promotable = false;
+        }
+
+        if self.tcx.type_needs_drop_given_env(ty, &self.param_env) {
+            self.promotable = false;
+        }
+    }
+
+    fn handle_const_fn_call(&mut self, def_id: DefId, ret_ty: Ty<'gcx>) {
+        self.add_type(ret_ty);
+
+        self.promotable &= if let Some(fn_id) = self.tcx.hir.as_local_node_id(def_id) {
+            FnLikeNode::from_node(self.tcx.hir.get(fn_id)).map_or(false, |fn_like| {
+                fn_like.constness() == hir::Constness::Const
+            })
+        } else {
+            self.tcx.sess.cstore.is_const_fn(def_id)
+        };
+    }
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for CheckCrateVisitor<'a, 'tcx> {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
+        NestedVisitorMap::None
+    }
+
+    fn visit_nested_body(&mut self, body_id: hir::BodyId) {
+        match self.tcx.rvalue_promotable_to_static.borrow_mut().entry(body_id.node_id) {
+            Entry::Occupied(_) => return,
+            Entry::Vacant(entry) => {
+                // Prevent infinite recursion on re-entry.
+                entry.insert(false);
+            }
+        }
+
+        let item_id = self.tcx.hir.body_owner(body_id);
+
+        let outer_in_fn = self.in_fn;
+        self.in_fn = match MirSource::from_node(self.tcx, item_id) {
+            MirSource::Fn(_) => true,
+            _ => false
         };
 
-        let qualif = self.with_mode(mode, |this| {
-            this.with_euv(Some(fn_id), |euv| euv.walk_fn(fd, b));
-            intravisit::walk_fn(this, fk, fd, b, s);
-            this.qualif
+        let outer_tables = self.tables;
+        self.tables = self.tcx.item_tables(self.tcx.hir.local_def_id(item_id));
+
+        let body = self.tcx.hir.body(body_id);
+        if !self.in_fn {
+            self.check_const_eval(&body.value);
+        }
+
+        let outer_penv = self.tcx.infer_ctxt(body_id, Reveal::UserFacing).enter(|infcx| {
+            let param_env = infcx.parameter_environment.clone();
+            let outer_penv = mem::replace(&mut self.param_env, param_env);
+            euv::ExprUseVisitor::new(self, &infcx).consume_body(body);
+            outer_penv
         });
 
-        // Keep only bits that aren't affected by function body (NON_ZERO_SIZED),
-        // and bits that don't change semantics, just optimizations (PREFER_IN_PLACE).
-        let qualif = qualif & (ConstQualif::NON_ZERO_SIZED | ConstQualif::PREFER_IN_PLACE);
+        self.visit_body(body);
 
-        self.tcx.const_qualif_map.borrow_mut().insert(fn_id, qualif);
-        qualif
+        self.param_env = outer_penv;
+        self.tables = outer_tables;
+        self.in_fn = outer_in_fn;
     }
 
-    fn add_qualif(&mut self, qualif: ConstQualif) {
-        self.qualif = self.qualif | qualif;
-    }
-
-    /// Returns true if the call is to a const fn or method.
-    fn handle_const_fn_call(&mut self,
-                            expr: &hir::Expr,
-                            def_id: DefId,
-                            ret_ty: Ty<'tcx>)
-                            -> bool {
-        if let Some(fn_like) = const_eval::lookup_const_fn_by_id(self.tcx, def_id) {
-            if
-                // we are in a static/const initializer
-                self.mode != Mode::Var &&
-
-                // feature-gate is not enabled
-                !self.tcx.sess.features.borrow().const_fn &&
-
-                // this doesn't come from a macro that has #[allow_internal_unstable]
-                !self.tcx.sess.codemap().span_allows_unstable(expr.span)
-            {
-                let mut err = self.tcx.sess.struct_span_err(
-                    expr.span,
-                    "const fns are an unstable feature");
-                fileline_help!(
-                    &mut err,
-                    expr.span,
-                    "in Nightly builds, add `#![feature(const_fn)]` to the crate \
-                     attributes to enable");
-                err.emit();
-            }
-
-            let qualif = self.fn_like(fn_like.kind(),
-                                      fn_like.decl(),
-                                      fn_like.body(),
-                                      fn_like.span(),
-                                      fn_like.id());
-            self.add_qualif(qualif);
-
-            if ret_ty.type_contents(self.tcx).interior_unsafe() {
-                self.add_qualif(ConstQualif::MUTABLE_MEM);
-            }
-
-            true
-        } else {
-            false
-        }
-    }
-
-    fn record_borrow(&mut self, id: ast::NodeId, mutbl: hir::Mutability) {
-        match self.rvalue_borrows.entry(id) {
-            Entry::Occupied(mut entry) => {
-                // Merge the two borrows, taking the most demanding
-                // one, mutability-wise.
-                if mutbl == hir::MutMutable {
-                    entry.insert(mutbl);
-                }
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(mutbl);
-            }
-        }
-    }
-
-    fn msg(&self) -> &'static str {
-        match self.mode {
-            Mode::Const => "constant",
-            Mode::ConstFn => "constant function",
-            Mode::StaticMut | Mode::Static => "static",
-            Mode::Var => unreachable!(),
-        }
-    }
-
-    fn check_static_mut_type(&self, e: &hir::Expr) {
-        let node_ty = self.tcx.node_id_to_type(e.id);
-        let tcontents = node_ty.type_contents(self.tcx);
-
-        let suffix = if tcontents.has_dtor() {
-            "destructors"
-        } else if tcontents.owns_owned() {
-            "boxes"
-        } else {
-            return
-        };
-
-        span_err!(self.tcx.sess, e.span, E0397,
-                 "mutable statics are not allowed to have {}", suffix);
-    }
-
-    fn check_static_type(&self, e: &hir::Expr) {
-        let ty = self.tcx.node_id_to_type(e.id);
-        let infcx = infer::new_infer_ctxt(self.tcx,
-                                          &self.tcx.tables,
-                                          None,
-                                          ProjectionMode::AnyFinal);
-        let cause = traits::ObligationCause::new(e.span, e.id, traits::SharedStatic);
-        let mut fulfillment_cx = traits::FulfillmentContext::new();
-        fulfillment_cx.register_builtin_bound(&infcx, ty, ty::BoundSync, cause);
-        match fulfillment_cx.select_all_or_error(&infcx) {
-            Ok(()) => { },
-            Err(ref errors) => {
-                traits::report_fulfillment_errors(&infcx, errors);
-            }
-        }
-    }
-}
-
-impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
-    fn visit_item(&mut self, i: &hir::Item) {
-        debug!("visit_item(item={})", self.tcx.map.node_to_string(i.id));
-        assert_eq!(self.mode, Mode::Var);
-        match i.node {
-            hir::ItemStatic(_, hir::MutImmutable, ref expr) => {
-                self.check_static_type(&expr);
-                self.global_expr(Mode::Static, &expr);
-            }
-            hir::ItemStatic(_, hir::MutMutable, ref expr) => {
-                self.check_static_mut_type(&expr);
-                self.global_expr(Mode::StaticMut, &expr);
-            }
-            hir::ItemConst(_, ref expr) => {
-                self.global_expr(Mode::Const, &expr);
-            }
-            hir::ItemEnum(ref enum_definition, _) => {
-                for var in &enum_definition.variants {
-                    if let Some(ref ex) = var.node.disr_expr {
-                        self.global_expr(Mode::Const, &ex);
-                    }
-                }
-            }
-            _ => {
-                intravisit::walk_item(self, i);
-            }
-        }
-    }
-
-    fn visit_trait_item(&mut self, t: &'v hir::TraitItem) {
-        match t.node {
-            hir::ConstTraitItem(_, ref default) => {
-                if let Some(ref expr) = *default {
-                    self.global_expr(Mode::Const, &expr);
-                } else {
-                    intravisit::walk_trait_item(self, t);
-                }
-            }
-            _ => self.with_mode(Mode::Var, |v| intravisit::walk_trait_item(v, t)),
-        }
-    }
-
-    fn visit_impl_item(&mut self, i: &'v hir::ImplItem) {
-        match i.node {
-            hir::ImplItemKind::Const(_, ref expr) => {
-                self.global_expr(Mode::Const, &expr);
-            }
-            _ => self.with_mode(Mode::Var, |v| intravisit::walk_impl_item(v, i)),
-        }
-    }
-
-    fn visit_fn(&mut self,
-                fk: FnKind<'v>,
-                fd: &'v hir::FnDecl,
-                b: &'v hir::Block,
-                s: Span,
-                fn_id: ast::NodeId) {
-        self.fn_like(fk, fd, b, s, fn_id);
-    }
-
-    fn visit_pat(&mut self, p: &hir::Pat) {
+    fn visit_pat(&mut self, p: &'tcx hir::Pat) {
         match p.node {
             PatKind::Lit(ref lit) => {
-                self.global_expr(Mode::Const, &lit);
+                self.check_const_eval(lit);
             }
-            PatKind::Range(ref start, ref end) => {
-                self.global_expr(Mode::Const, &start);
-                self.global_expr(Mode::Const, &end);
-
-                match const_eval::compare_lit_exprs(self.tcx, start, end) {
-                    Some(Ordering::Less) |
-                    Some(Ordering::Equal) => {}
-                    Some(Ordering::Greater) => {
-                        span_err!(self.tcx.sess, start.span, E0030,
-                            "lower range bound must be less than or equal to upper");
+            PatKind::Range(ref start, ref end, RangeEnd::Excluded) => {
+                let const_cx = ConstContext::with_tables(self.tcx, self.tables);
+                match const_cx.compare_lit_exprs(p.span, start, end) {
+                    Ok(Ordering::Less) => {}
+                    Ok(Ordering::Equal) |
+                    Ok(Ordering::Greater) => {
+                        span_err!(self.tcx.sess,
+                                  start.span,
+                                  E0579,
+                                  "lower range bound must be less than upper");
                     }
-                    None => {
-                        self.tcx.sess.delay_span_bug(start.span,
-                                                     "non-constant path in constant expr");
-                    }
+                    Err(ErrorReported) => {}
                 }
             }
-            _ => intravisit::walk_pat(self, p)
-        }
-    }
-
-    fn visit_block(&mut self, block: &hir::Block) {
-        // Check all statements in the block
-        for stmt in &block.stmts {
-            match stmt.node {
-                hir::StmtDecl(ref decl, _) => {
-                    match decl.node {
-                        hir::DeclLocal(_) => {},
-                        // Item statements are allowed
-                        hir::DeclItem(_) => continue
+            PatKind::Range(ref start, ref end, RangeEnd::Included) => {
+                let const_cx = ConstContext::with_tables(self.tcx, self.tables);
+                match const_cx.compare_lit_exprs(p.span, start, end) {
+                    Ok(Ordering::Less) |
+                    Ok(Ordering::Equal) => {}
+                    Ok(Ordering::Greater) => {
+                        struct_span_err!(self.tcx.sess, start.span, E0030,
+                            "lower range bound must be less than or equal to upper")
+                            .span_label(start.span, &format!("lower bound larger than upper bound"))
+                            .emit();
                     }
+                    Err(ErrorReported) => {}
                 }
-                hir::StmtExpr(_, _) => {},
-                hir::StmtSemi(_, _) => {},
             }
-            self.add_qualif(ConstQualif::NOT_CONST);
-            // anything else should have been caught by check_const_fn
-            assert_eq!(self.mode, Mode::Var);
+            _ => {}
         }
-        intravisit::walk_block(self, block);
+        intravisit::walk_pat(self, p);
     }
 
-    fn visit_expr(&mut self, ex: &hir::Expr) {
-        let mut outer = self.qualif;
-        self.qualif = ConstQualif::empty();
+    fn visit_stmt(&mut self, stmt: &'tcx hir::Stmt) {
+        match stmt.node {
+            hir::StmtDecl(ref decl, _) => {
+                match decl.node {
+                    hir::DeclLocal(_) => {
+                        self.promotable = false;
+                    }
+                    // Item statements are allowed
+                    hir::DeclItem(_) => {}
+                }
+            }
+            hir::StmtExpr(..) |
+            hir::StmtSemi(..) => {
+                self.promotable = false;
+            }
+        }
+        intravisit::walk_stmt(self, stmt);
+    }
 
-        let node_ty = self.tcx.node_id_to_type(ex.id);
+    fn visit_expr(&mut self, ex: &'tcx hir::Expr) {
+        let outer = self.promotable;
+        self.promotable = true;
+
+        let node_ty = self.tables.node_id_to_type(ex.id);
         check_expr(self, ex, node_ty);
         check_adjustments(self, ex);
 
-        // Special-case some expressions to avoid certain flags bubbling up.
-        match ex.node {
-            hir::ExprCall(ref callee, ref args) => {
-                for arg in args {
-                    self.visit_expr(&arg)
-                }
-
-                let inner = self.qualif;
-                self.visit_expr(&callee);
-                // The callee's size doesn't count in the call.
-                let added = self.qualif - inner;
-                self.qualif = inner | (added - ConstQualif::NON_ZERO_SIZED);
-            }
-            hir::ExprRepeat(ref element, _) => {
-                self.visit_expr(&element);
-                // The count is checked elsewhere (typeck).
-                let count = match node_ty.sty {
-                    ty::TyArray(_, n) => n,
-                    _ => unreachable!()
-                };
-                // [element; 0] is always zero-sized.
-                if count == 0 {
-                    self.qualif.remove(ConstQualif::NON_ZERO_SIZED | ConstQualif::PREFER_IN_PLACE);
+        if let hir::ExprMatch(ref discr, ref arms, _) = ex.node {
+            // Compute the most demanding borrow from all the arms'
+            // patterns and set that on the discriminator.
+            let mut mut_borrow = false;
+            for pat in arms.iter().flat_map(|arm| &arm.pats) {
+                if self.mut_rvalue_borrows.remove(&pat.id) {
+                    mut_borrow = true;
                 }
             }
-            hir::ExprMatch(ref discr, ref arms, _) => {
-                // Compute the most demanding borrow from all the arms'
-                // patterns and set that on the discriminator.
-                let mut borrow = None;
-                for pat in arms.iter().flat_map(|arm| &arm.pats) {
-                    let pat_borrow = self.rvalue_borrows.remove(&pat.id);
-                    match (borrow, pat_borrow) {
-                        (None, _) | (_, Some(hir::MutMutable)) => {
-                            borrow = pat_borrow;
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(mutbl) = borrow {
-                    self.record_borrow(discr.id, mutbl);
-                }
-                intravisit::walk_expr(self, ex);
+            if mut_borrow {
+                self.mut_rvalue_borrows.insert(discr.id);
             }
-            // Division by zero and overflow checking.
-            hir::ExprBinary(op, _, _) => {
-                intravisit::walk_expr(self, ex);
-                let div_or_rem = op.node == hir::BiDiv || op.node == hir::BiRem;
-                match node_ty.sty {
-                    ty::TyUint(_) | ty::TyInt(_) if div_or_rem => {
-                        if !self.qualif.intersects(ConstQualif::NOT_CONST) {
-                            match const_eval::eval_const_expr_partial(
-                                    self.tcx, ex, ExprTypeChecked, None) {
-                                Ok(_) => {}
-                                Err(ConstEvalErr { kind: IndexOpFeatureGated, ..}) => {},
-                                Err(msg) => {
-                                    self.tcx.sess.add_lint(CONST_ERR, ex.id,
-                                                           msg.span,
-                                                           msg.description().into_owned())
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            _ => intravisit::walk_expr(self, ex)
         }
+
+        intravisit::walk_expr(self, ex);
 
         // Handle borrows on (or inside the autorefs of) this expression.
-        match self.rvalue_borrows.remove(&ex.id) {
-            Some(hir::MutImmutable) => {
-                // Constants cannot be borrowed if they contain interior mutability as
-                // it means that our "silent insertion of statics" could change
-                // initializer values (very bad).
-                // If the type doesn't have interior mutability, then `ConstQualif::MUTABLE_MEM` has
-                // propagated from another error, so erroring again would be just noise.
-                let tc = node_ty.type_contents(self.tcx);
-                if self.qualif.intersects(ConstQualif::MUTABLE_MEM) && tc.interior_unsafe() {
-                    outer = outer | ConstQualif::NOT_CONST;
-                    if self.mode != Mode::Var {
-                        span_err!(self.tcx.sess, ex.span, E0492,
-                                  "cannot borrow a constant which contains \
-                                   interior mutability, create a static instead");
-                    }
-                }
-                // If the reference has to be 'static, avoid in-place initialization
-                // as that will end up pointing to the stack instead.
-                if !self.qualif.intersects(ConstQualif::NON_STATIC_BORROWS) {
-                    self.qualif = self.qualif - ConstQualif::PREFER_IN_PLACE;
-                    self.add_qualif(ConstQualif::HAS_STATIC_BORROWS);
-                }
-            }
-            Some(hir::MutMutable) => {
-                // `&mut expr` means expr could be mutated, unless it's zero-sized.
-                if self.qualif.intersects(ConstQualif::NON_ZERO_SIZED) {
-                    if self.mode == Mode::Var {
-                        outer = outer | ConstQualif::NOT_CONST;
-                        self.add_qualif(ConstQualif::MUTABLE_MEM);
-                    } else {
-                        span_err!(self.tcx.sess, ex.span, E0017,
-                            "references in {}s may only refer \
-                             to immutable values", self.msg())
-                    }
-                }
-                if !self.qualif.intersects(ConstQualif::NON_STATIC_BORROWS) {
-                    self.add_qualif(ConstQualif::HAS_STATIC_BORROWS);
-                }
-            }
-            None => {}
+        if self.mut_rvalue_borrows.remove(&ex.id) {
+            self.promotable = false;
         }
-        self.tcx.const_qualif_map.borrow_mut().insert(ex.id, self.qualif);
-        // Don't propagate certain flags.
-        self.qualif = outer | (self.qualif - ConstQualif::HAS_STATIC_BORROWS);
+
+        if self.in_fn && self.promotable {
+            let const_cx = ConstContext::with_tables(self.tcx, self.tables);
+            match const_cx.eval(ex) {
+                Ok(_) => {}
+                Err(ConstEvalErr { kind: UnimplementedConstVal(_), .. }) |
+                Err(ConstEvalErr { kind: MiscCatchAll, .. }) |
+                Err(ConstEvalErr { kind: MiscBinaryOp, .. }) |
+                Err(ConstEvalErr { kind: NonConstPath, .. }) |
+                Err(ConstEvalErr { kind: ErroneousReferencedConstant(_), .. }) |
+                Err(ConstEvalErr { kind: Math(ConstMathErr::Overflow(Op::Shr)), .. }) |
+                Err(ConstEvalErr { kind: Math(ConstMathErr::Overflow(Op::Shl)), .. }) |
+                Err(ConstEvalErr { kind: IndexOpFeatureGated, .. }) => {}
+                Err(ConstEvalErr { kind: TypeckError, .. }) => {}
+                Err(msg) => {
+                    self.tcx.sess.add_lint(CONST_ERR,
+                                           ex.id,
+                                           msg.span,
+                                           msg.description().into_oneline().into_owned())
+                }
+            }
+        }
+
+        self.tcx.rvalue_promotable_to_static.borrow_mut().insert(ex.id, self.promotable);
+        self.promotable &= outer;
     }
 }
 
@@ -503,17 +270,10 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckCrateVisitor<'a, 'tcx> {
 /// every nested expression. If the expression is not part
 /// of a const/static item, it is qualified for promotion
 /// instead of producing errors.
-fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>,
-                        e: &hir::Expr, node_ty: Ty<'tcx>) {
+fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr, node_ty: Ty<'tcx>) {
     match node_ty.sty {
-        ty::TyStruct(def, _) |
-        ty::TyEnum(def, _) if def.has_dtor() => {
-            v.add_qualif(ConstQualif::NEEDS_DROP);
-            if v.mode != Mode::Var {
-                span_err!(v.tcx.sess, e.span, E0493,
-                          "{}s are not allowed to have destructors",
-                          v.msg());
-            }
+        ty::TyAdt(def, _) if def.has_dtor(v.tcx) => {
+            v.promotable = false;
         }
         _ => {}
     }
@@ -522,112 +282,65 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>,
     match e.node {
         hir::ExprUnary(..) |
         hir::ExprBinary(..) |
-        hir::ExprIndex(..) if v.tcx.tables.borrow().method_map.contains_key(&method_call) => {
-            v.add_qualif(ConstQualif::NOT_CONST);
-            if v.mode != Mode::Var {
-                span_err!(v.tcx.sess, e.span, E0011,
-                            "user-defined operators are not allowed in {}s", v.msg());
-            }
+        hir::ExprIndex(..) if v.tables.method_map.contains_key(&method_call) => {
+            v.promotable = false;
         }
         hir::ExprBox(_) => {
-            v.add_qualif(ConstQualif::NOT_CONST);
-            if v.mode != Mode::Var {
-                span_err!(v.tcx.sess, e.span, E0010,
-                          "allocations are not allowed in {}s", v.msg());
-            }
+            v.promotable = false;
         }
         hir::ExprUnary(op, ref inner) => {
-            match v.tcx.node_id_to_type(inner.id).sty {
+            match v.tables.node_id_to_type(inner.id).sty {
                 ty::TyRawPtr(_) => {
                     assert!(op == hir::UnDeref);
 
-                    v.add_qualif(ConstQualif::NOT_CONST);
-                    if v.mode != Mode::Var {
-                        span_err!(v.tcx.sess, e.span, E0396,
-                                  "raw pointers cannot be dereferenced in {}s", v.msg());
-                    }
+                    v.promotable = false;
                 }
                 _ => {}
             }
         }
         hir::ExprBinary(op, ref lhs, _) => {
-            match v.tcx.node_id_to_type(lhs.id).sty {
+            match v.tables.node_id_to_type(lhs.id).sty {
                 ty::TyRawPtr(_) => {
                     assert!(op.node == hir::BiEq || op.node == hir::BiNe ||
                             op.node == hir::BiLe || op.node == hir::BiLt ||
                             op.node == hir::BiGe || op.node == hir::BiGt);
 
-                    v.add_qualif(ConstQualif::NOT_CONST);
-                    if v.mode != Mode::Var {
-                        span_err!(v.tcx.sess, e.span, E0395,
-                                  "raw pointers cannot be compared in {}s", v.msg());
-                    }
+                    v.promotable = false;
                 }
                 _ => {}
             }
         }
         hir::ExprCast(ref from, _) => {
             debug!("Checking const cast(id={})", from.id);
-            match v.tcx.cast_kinds.borrow().get(&from.id) {
-                None => v.tcx.sess.span_bug(e.span, "no kind for cast"),
+            match v.tables.cast_kinds.get(&from.id) {
+                None => span_bug!(e.span, "no kind for cast"),
                 Some(&CastKind::PtrAddrCast) | Some(&CastKind::FnPtrAddrCast) => {
-                    v.add_qualif(ConstQualif::NOT_CONST);
-                    if v.mode != Mode::Var {
-                        span_err!(v.tcx.sess, e.span, E0018,
-                                  "raw pointers cannot be cast to integers in {}s", v.msg());
-                    }
+                    v.promotable = false;
                 }
                 _ => {}
             }
         }
-        hir::ExprPath(..) => {
-            let def = v.tcx.def_map.borrow().get(&e.id).map(|d| d.full_def());
+        hir::ExprPath(ref qpath) => {
+            let def = v.tables.qpath_def(qpath, e.id);
             match def {
-                Some(Def::Variant(..)) => {
-                    // Count the discriminator or function pointer.
-                    v.add_qualif(ConstQualif::NON_ZERO_SIZED);
-                }
-                Some(Def::Struct(..)) => {
-                    if let ty::TyFnDef(..) = node_ty.sty {
-                        // Count the function pointer.
-                        v.add_qualif(ConstQualif::NON_ZERO_SIZED);
-                    }
-                }
-                Some(Def::Fn(..)) | Some(Def::Method(..)) => {
-                    // Count the function pointer.
-                    v.add_qualif(ConstQualif::NON_ZERO_SIZED);
-                }
-                Some(Def::Static(..)) => {
-                    match v.mode {
-                        Mode::Static | Mode::StaticMut => {}
-                        Mode::Const | Mode::ConstFn => {
-                            span_err!(v.tcx.sess, e.span, E0013,
-                                "{}s cannot refer to other statics, insert \
-                                 an intermediate constant instead", v.msg());
+                Def::VariantCtor(..) | Def::StructCtor(..) |
+                Def::Fn(..) | Def::Method(..) => {}
+                Def::AssociatedConst(_) => v.add_type(node_ty),
+                Def::Const(did) => {
+                    v.promotable &= if let Some(node_id) = v.tcx.hir.as_local_node_id(did) {
+                        match v.tcx.hir.expect_item(node_id).node {
+                            hir::ItemConst(_, body) => {
+                                v.visit_nested_body(body);
+                                v.tcx.rvalue_promotable_to_static.borrow()[&body.node_id]
+                            }
+                            _ => false
                         }
-                        Mode::Var => v.add_qualif(ConstQualif::NOT_CONST)
-                    }
+                    } else {
+                        v.tcx.sess.cstore.const_is_rvalue_promotable_to_static(did)
+                    };
                 }
-                Some(Def::Const(did)) |
-                Some(Def::AssociatedConst(did)) => {
-                    let substs = Some(v.tcx.node_id_item_substs(e.id).substs);
-                    if let Some((expr, _)) = const_eval::lookup_const_by_id(v.tcx, did, substs) {
-                        let inner = v.global_expr(Mode::Const, expr);
-                        v.add_qualif(inner);
-                    }
-                }
-                Some(Def::Local(..)) if v.mode == Mode::ConstFn => {
-                    // Sadly, we can't determine whether the types are zero-sized.
-                    v.add_qualif(ConstQualif::NOT_CONST | ConstQualif::NON_ZERO_SIZED);
-                }
-                def => {
-                    v.add_qualif(ConstQualif::NOT_CONST);
-                    if v.mode != Mode::Var {
-                        debug!("(checking const) found bad def: {:?}", def);
-                        span_err!(v.tcx.sess, e.span, E0014,
-                                  "paths in {}s may only refer to constants \
-                                   or functions", v.msg());
-                    }
+                _ => {
+                    v.promotable = false;
                 }
             }
         }
@@ -642,92 +355,54 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>,
                     _ => break
                 };
             }
-            let def = v.tcx.def_map.borrow().get(&callee.id).map(|d| d.full_def());
-            let is_const = match def {
-                Some(Def::Struct(..)) => true,
-                Some(Def::Variant(..)) => {
-                    // Count the discriminator.
-                    v.add_qualif(ConstQualif::NON_ZERO_SIZED);
-                    true
-                }
-                Some(Def::Fn(did)) => {
-                    v.handle_const_fn_call(e, did, node_ty)
-                }
-                Some(Def::Method(did)) => {
-                    match v.tcx.impl_or_trait_item(did).container() {
-                        ty::ImplContainer(_) => {
-                            v.handle_const_fn_call(e, did, node_ty)
-                        }
-                        ty::TraitContainer(_) => false
-                    }
-                }
-                _ => false
+            // The callee is an arbitrary expression, it doesn't necessarily have a definition.
+            let def = if let hir::ExprPath(ref qpath) = callee.node {
+                v.tables.qpath_def(qpath, callee.id)
+            } else {
+                Def::Err
             };
-            if !is_const {
-                v.add_qualif(ConstQualif::NOT_CONST);
-                if v.mode != Mode::Var {
-                    // FIXME(#24111) Remove this check when const fn stabilizes
-                    let (msg, note) =
-                        if let UnstableFeatures::Disallow = v.tcx.sess.opts.unstable_features {
-                        (format!("function calls in {}s are limited to \
-                                  struct and enum constructors",
-                                 v.msg()),
-                         Some("a limited form of compile-time function \
-                               evaluation is available on a nightly \
-                               compiler via `const fn`"))
-                    } else {
-                        (format!("function calls in {}s are limited \
-                                  to constant functions, \
-                                  struct and enum constructors",
-                                 v.msg()),
-                         None)
-                    };
-                    let mut err = struct_span_err!(v.tcx.sess, e.span, E0015, "{}", msg);
-                    if let Some(note) = note {
-                        err.span_note(e.span, note);
-                    }
-                    err.emit();
+            match def {
+                Def::StructCtor(_, CtorKind::Fn) |
+                Def::VariantCtor(_, CtorKind::Fn) => {}
+                Def::Fn(did) => {
+                    v.handle_const_fn_call(did, node_ty)
                 }
+                Def::Method(did) => {
+                    match v.tcx.associated_item(did).container {
+                        ty::ImplContainer(_) => {
+                            v.handle_const_fn_call(did, node_ty)
+                        }
+                        ty::TraitContainer(_) => v.promotable = false
+                    }
+                }
+                _ => v.promotable = false
             }
         }
         hir::ExprMethodCall(..) => {
-            let method = v.tcx.tables.borrow().method_map[&method_call];
-            let is_const = match v.tcx.impl_or_trait_item(method.def_id).container() {
-                ty::ImplContainer(_) => v.handle_const_fn_call(e, method.def_id, node_ty),
-                ty::TraitContainer(_) => false
-            };
-            if !is_const {
-                v.add_qualif(ConstQualif::NOT_CONST);
-                if v.mode != Mode::Var {
-                    span_err!(v.tcx.sess, e.span, E0378,
-                              "method calls in {}s are limited to \
-                               constant inherent methods", v.msg());
-                }
+            let method = v.tables.method_map[&method_call];
+            match v.tcx.associated_item(method.def_id).container {
+                ty::ImplContainer(_) => v.handle_const_fn_call(method.def_id, node_ty),
+                ty::TraitContainer(_) => v.promotable = false
             }
         }
         hir::ExprStruct(..) => {
-            let did = v.tcx.def_map.borrow().get(&e.id).map(|def| def.def_id());
-            if did == v.tcx.lang_items.unsafe_cell_type() {
-                v.add_qualif(ConstQualif::MUTABLE_MEM);
+            if let ty::TyAdt(adt, ..) = v.tables.expr_ty(e).sty {
+                // unsafe_cell_type doesn't necessarily exist with no_core
+                if Some(adt.did) == v.tcx.lang_items.unsafe_cell_type() {
+                    v.promotable = false;
+                }
             }
         }
 
         hir::ExprLit(_) |
-        hir::ExprAddrOf(..) => {
-            v.add_qualif(ConstQualif::NON_ZERO_SIZED);
-        }
-
-        hir::ExprRepeat(..) => {
-            v.add_qualif(ConstQualif::PREFER_IN_PLACE);
-        }
+        hir::ExprAddrOf(..) |
+        hir::ExprRepeat(..) => {}
 
         hir::ExprClosure(..) => {
             // Paths in constant contexts cannot refer to local variables,
             // as there are none, and thus closures can't have upvars there.
             if v.tcx.with_freevars(e.id, |fv| !fv.is_empty()) {
-                assert!(v.mode == Mode::Var,
-                        "global closures can't capture anything");
-                v.add_qualif(ConstQualif::NOT_CONST);
+                v.promotable = false;
             }
         }
 
@@ -735,7 +410,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>,
         hir::ExprIndex(..) |
         hir::ExprField(..) |
         hir::ExprTupField(..) |
-        hir::ExprVec(_) |
+        hir::ExprArray(_) |
         hir::ExprType(..) |
         hir::ExprTup(..) => {}
 
@@ -748,7 +423,7 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>,
         hir::ExprLoop(..) |
 
         // More control flow (also not very meaningful).
-        hir::ExprBreak(_) |
+        hir::ExprBreak(..) |
         hir::ExprAgain(_) |
         hir::ExprRet(_) |
 
@@ -756,88 +431,59 @@ fn check_expr<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>,
         hir::ExprAssign(..) |
         hir::ExprAssignOp(..) |
         hir::ExprInlineAsm(..) => {
-            v.add_qualif(ConstQualif::NOT_CONST);
-            if v.mode != Mode::Var {
-                span_err!(v.tcx.sess, e.span, E0019,
-                          "{} contains unimplemented expression type", v.msg());
-            }
+            v.promotable = false;
         }
     }
 }
 
 /// Check the adjustments of an expression
 fn check_adjustments<'a, 'tcx>(v: &mut CheckCrateVisitor<'a, 'tcx>, e: &hir::Expr) {
-    match v.tcx.tables.borrow().adjustments.get(&e.id) {
-        None |
-        Some(&ty::adjustment::AdjustReifyFnPointer) |
-        Some(&ty::adjustment::AdjustUnsafeFnPointer) |
-        Some(&ty::adjustment::AdjustMutToConstPointer) => {}
+    use rustc::ty::adjustment::*;
 
-        Some(&ty::adjustment::AdjustDerefRef(
-            ty::adjustment::AutoDerefRef { autoderefs, .. }
-        )) => {
-            if (0..autoderefs as u32).any(|autoderef| {
-                    v.tcx.is_overloaded_autoderef(e.id, autoderef)
-            }) {
-                v.add_qualif(ConstQualif::NOT_CONST);
-                if v.mode != Mode::Var {
-                    span_err!(v.tcx.sess, e.span, E0400,
-                              "user-defined dereference operators are not allowed in {}s",
-                              v.msg());
-                }
+    match v.tables.adjustments.get(&e.id).map(|adj| adj.kind) {
+        None |
+        Some(Adjust::NeverToAny) |
+        Some(Adjust::ReifyFnPointer) |
+        Some(Adjust::UnsafeFnPointer) |
+        Some(Adjust::ClosureFnPointer) |
+        Some(Adjust::MutToConstPointer) => {}
+
+        Some(Adjust::DerefRef { autoderefs, .. }) => {
+            if (0..autoderefs as u32)
+                .any(|autoderef| v.tables.is_overloaded_autoderef(e.id, autoderef)) {
+                v.promotable = false;
             }
         }
     }
 }
 
-pub fn check_crate(tcx: &TyCtxt) {
-    tcx.visit_all_items_in_krate(DepNode::CheckConst, &mut CheckCrateVisitor {
-        tcx: tcx,
-        mode: Mode::Var,
-        qualif: ConstQualif::NOT_CONST,
-        rvalue_borrows: NodeMap()
-    });
+pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
+    tcx.visit_all_item_likes_in_krate(DepNode::CheckConst,
+                                      &mut CheckCrateVisitor {
+                                          tcx: tcx,
+                                          tables: &ty::TypeckTables::empty(),
+                                          in_fn: false,
+                                          promotable: false,
+                                          mut_rvalue_borrows: NodeSet(),
+                                          param_env: tcx.empty_parameter_environment(),
+                                      }.as_deep_visitor());
     tcx.sess.abort_if_errors();
 }
 
-impl<'a, 'tcx> euv::Delegate<'tcx> for CheckCrateVisitor<'a, 'tcx> {
+impl<'a, 'gcx, 'tcx> euv::Delegate<'tcx> for CheckCrateVisitor<'a, 'gcx> {
     fn consume(&mut self,
                _consume_id: ast::NodeId,
-               consume_span: Span,
-               cmt: mc::cmt,
-               _mode: euv::ConsumeMode) {
-        let mut cur = &cmt;
-        loop {
-            match cur.cat {
-                Categorization::StaticItem => {
-                    if self.mode != Mode::Var {
-                        // statics cannot be consumed by value at any time, that would imply
-                        // that they're an initializer (what a const is for) or kept in sync
-                        // over time (not feasible), so deny it outright.
-                        span_err!(self.tcx.sess, consume_span, E0394,
-                                  "cannot refer to other statics by value, use the \
-                                   address-of operator or a constant instead");
-                    }
-                    break;
-                }
-                Categorization::Deref(ref cmt, _, _) |
-                Categorization::Downcast(ref cmt, _) |
-                Categorization::Interior(ref cmt, _) => cur = cmt,
+               _consume_span: Span,
+               _cmt: mc::cmt,
+               _mode: euv::ConsumeMode) {}
 
-                Categorization::Rvalue(..) |
-                Categorization::Upvar(..) |
-                Categorization::Local(..) => break
-            }
-        }
-    }
     fn borrow(&mut self,
               borrow_id: ast::NodeId,
-              borrow_span: Span,
+              _borrow_span: Span,
               cmt: mc::cmt<'tcx>,
-              _loan_region: ty::Region,
+              _loan_region: &'tcx ty::Region,
               bk: ty::BorrowKind,
-              loan_cause: euv::LoanCause)
-    {
+              loan_cause: euv::LoanCause) {
         // Kind of hacky, but we allow Unsafe coercions in constants.
         // These occur when we convert a &T or *T to a *U, as well as
         // when making a thin pointer (e.g., `*T`) into a fat pointer
@@ -846,11 +492,10 @@ impl<'a, 'tcx> euv::Delegate<'tcx> for CheckCrateVisitor<'a, 'tcx> {
             euv::LoanCause::AutoUnsafe => {
                 return;
             }
-            _ => { }
+            _ => {}
         }
 
         let mut cur = &cmt;
-        let mut is_interior = false;
         loop {
             match cur.cat {
                 Categorization::Rvalue(..) => {
@@ -858,62 +503,35 @@ impl<'a, 'tcx> euv::Delegate<'tcx> for CheckCrateVisitor<'a, 'tcx> {
                         // Ignore the dummy immutable borrow created by EUV.
                         break;
                     }
-                    let mutbl = bk.to_mutbl_lossy();
-                    if mutbl == hir::MutMutable && self.mode == Mode::StaticMut {
-                        // Mutable slices are the only `&mut` allowed in
-                        // globals, but only in `static mut`, nowhere else.
-                        // FIXME: This exception is really weird... there isn't
-                        // any fundamental reason to restrict this based on
-                        // type of the expression.  `&mut [1]` has exactly the
-                        // same representation as &mut 1.
-                        match cmt.ty.sty {
-                            ty::TyArray(_, _) | ty::TySlice(_) => break,
-                            _ => {}
-                        }
+                    if bk.to_mutbl_lossy() == hir::MutMutable {
+                        self.mut_rvalue_borrows.insert(borrow_id);
                     }
-                    self.record_borrow(borrow_id, mutbl);
                     break;
                 }
                 Categorization::StaticItem => {
-                    if is_interior && self.mode != Mode::Var {
-                        // Borrowed statics can specifically *only* have their address taken,
-                        // not any number of other borrows such as borrowing fields, reading
-                        // elements of an array, etc.
-                        span_err!(self.tcx.sess, borrow_span, E0494,
-                                  "cannot refer to the interior of another \
-                                   static, use a constant instead");
-                    }
                     break;
                 }
-                Categorization::Deref(ref cmt, _, _) |
+                Categorization::Deref(ref cmt, ..) |
                 Categorization::Downcast(ref cmt, _) |
                 Categorization::Interior(ref cmt, _) => {
-                    is_interior = true;
                     cur = cmt;
                 }
 
                 Categorization::Upvar(..) |
-                Categorization::Local(..) => break
+                Categorization::Local(..) => break,
             }
         }
     }
 
-    fn decl_without_init(&mut self,
-                         _id: ast::NodeId,
-                         _span: Span) {}
+    fn decl_without_init(&mut self, _id: ast::NodeId, _span: Span) {}
     fn mutate(&mut self,
               _assignment_id: ast::NodeId,
               _assignment_span: Span,
               _assignee_cmt: mc::cmt,
-              _mode: euv::MutateMode) {}
+              _mode: euv::MutateMode) {
+    }
 
-    fn matched_pat(&mut self,
-                   _: &hir::Pat,
-                   _: mc::cmt,
-                   _: euv::MatchMode) {}
+    fn matched_pat(&mut self, _: &hir::Pat, _: mc::cmt, _: euv::MatchMode) {}
 
-    fn consume_pat(&mut self,
-                   _consume_pat: &hir::Pat,
-                   _cmt: mc::cmt,
-                   _mode: euv::ConsumeMode) {}
+    fn consume_pat(&mut self, _consume_pat: &hir::Pat, _cmt: mc::cmt, _mode: euv::ConsumeMode) {}
 }

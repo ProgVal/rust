@@ -13,15 +13,19 @@ use std::collections::BTreeMap;
 use std::env;
 
 use ast;
-use ast::{Ident, Name, TokenTree};
-use codemap::Span;
+use ast::{Ident, Name};
+use syntax_pos::Span;
 use ext::base::{ExtCtxt, MacEager, MacResult};
 use ext::build::AstBuilder;
 use parse::token;
 use ptr::P;
+use symbol::Symbol;
+use tokenstream::{TokenTree};
 use util::small_vector::SmallVector;
 
 use diagnostics::metadata::output_metadata;
+
+pub use errors::*;
 
 // Maximum width of any line in an extended error description (inclusive).
 const MAX_DESCRIPTION_WIDTH: usize = 80;
@@ -54,7 +58,7 @@ pub fn expand_diagnostic_used<'cx>(ecx: &'cx mut ExtCtxt,
                                    token_tree: &[TokenTree])
                                    -> Box<MacResult+'cx> {
     let code = match (token_tree.len(), token_tree.get(0)) {
-        (1, Some(&TokenTree::Token(_, token::Ident(code, _)))) => code,
+        (1, Some(&TokenTree::Token(_, token::Ident(code)))) => code,
         _ => unreachable!()
     };
 
@@ -92,10 +96,10 @@ pub fn expand_register_diagnostic<'cx>(ecx: &'cx mut ExtCtxt,
         token_tree.get(1),
         token_tree.get(2)
     ) {
-        (1, Some(&TokenTree::Token(_, token::Ident(ref code, _))), None, None) => {
+        (1, Some(&TokenTree::Token(_, token::Ident(ref code))), None, None) => {
             (code, None)
         },
-        (3, Some(&TokenTree::Token(_, token::Ident(ref code, _))),
+        (3, Some(&TokenTree::Token(_, token::Ident(ref code))),
             Some(&TokenTree::Token(_, token::Comma)),
             Some(&TokenTree::Token(_, token::Literal(token::StrRaw(description, _), None)))) => {
             (code, Some(description))
@@ -138,7 +142,7 @@ pub fn expand_register_diagnostic<'cx>(ecx: &'cx mut ExtCtxt,
             ));
         }
     });
-    let sym = Ident::with_empty_ctxt(token::gensym(&format!(
+    let sym = Ident::with_empty_ctxt(Symbol::gensym(&format!(
         "__register_diagnostic_{}", code
     )));
     MacEager::items(SmallVector::many(vec![
@@ -160,9 +164,9 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
     let (crate_name, name) = match (&token_tree[0], &token_tree[2]) {
         (
             // Crate name.
-            &TokenTree::Token(_, token::Ident(ref crate_name, _)),
+            &TokenTree::Token(_, token::Ident(ref crate_name)),
             // DIAGNOSTICS ident.
-            &TokenTree::Token(_, token::Ident(ref name, _))
+            &TokenTree::Token(_, token::Ident(ref name))
         ) => (*&crate_name, name),
         _ => unreachable!()
     };
@@ -191,11 +195,11 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
     let (count, expr) =
         with_registered_diagnostics(|diagnostics| {
             let descriptions: Vec<P<ast::Expr>> =
-                diagnostics.iter().filter_map(|(code, info)| {
+                diagnostics.iter().filter_map(|(&code, info)| {
                     info.description.map(|description| {
                         ecx.expr_tuple(span, vec![
-                            ecx.expr_str(span, code.as_str()),
-                            ecx.expr_str(span, description.as_str())
+                            ecx.expr_str(span, code),
+                            ecx.expr_str(span, description)
                         ])
                     })
                 }).collect();
@@ -212,7 +216,7 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
 
     let ty = ecx.ty(
         span,
-        ast::TyKind::FixedLengthVec(
+        ast::TyKind::Array(
             ecx.ty(
                 span,
                 ast::TyKind::Tup(vec![ty_str.clone(), ty_str])

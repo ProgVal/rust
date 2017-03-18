@@ -97,44 +97,23 @@
 //! virtually impossible. Thus, symbol hash generation exclusively relies on
 //! DefPaths which are much more robust in the face of changes to the code base.
 
-use common::{CrateContext, gensym_name};
+use common::SharedCrateContext;
 use monomorphize::Instance;
-use util::sha2::{Digest, Sha256};
 
-use rustc::middle::cstore;
-use rustc::middle::def_id::DefId;
-use rustc::ty::{self, TypeFoldable};
-use rustc::ty::item_path::{ItemPathBuffer, RootMode};
-use rustc::front::map::definitions::{DefPath, DefPathData};
+use rustc::middle::weak_lang_items;
+use rustc::hir::def_id::LOCAL_CRATE;
+use rustc::hir::map as hir_map;
+use rustc::ty::{self, Ty, TypeFoldable};
+use rustc::ty::fold::TypeVisitor;
+use rustc::ty::item_path::{self, ItemPathBuffer, RootMode};
+use rustc::ty::subst::Substs;
+use rustc::hir::map::definitions::{DefPath, DefPathData};
+use rustc::util::common::record_time;
 
-use std::fmt::Write;
-use syntax::parse::token::{self, InternedString};
-use serialize::hex::ToHex;
+use syntax::attr;
+use syntax::symbol::{Symbol, InternedString};
 
-pub fn def_id_to_string<'tcx>(tcx: &ty::TyCtxt<'tcx>, def_id: DefId) -> String {
-    let def_path = tcx.def_path(def_id);
-    def_path_to_string(tcx, &def_path)
-}
-
-pub fn def_path_to_string<'tcx>(tcx: &ty::TyCtxt<'tcx>, def_path: &DefPath) -> String {
-    let mut s = String::with_capacity(def_path.data.len() * 16);
-
-    s.push_str(&tcx.crate_name(def_path.krate));
-    s.push_str("/");
-    s.push_str(&tcx.crate_disambiguator(def_path.krate));
-
-    for component in &def_path.data {
-        write!(s,
-               "::{}[{}]",
-               component.data.as_interned_str(),
-               component.disambiguator)
-            .unwrap();
-    }
-
-    s
-}
-
-fn get_symbol_hash<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
+fn get_symbol_hash<'a, 'tcx>(scx: &SharedCrateContext<'a, 'tcx>,
 
                              // path to the item this name is for
                              def_path: &DefPath,
@@ -143,110 +122,151 @@ fn get_symbol_hash<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
                              // parameters substituted; this is
                              // included in the hash as a kind of
                              // safeguard.
-                             item_type: ty::Ty<'tcx>,
+                             item_type: Ty<'tcx>,
 
                              // values for generic type parameters,
                              // if any.
-                             parameters: &[ty::Ty<'tcx>])
+                             substs: Option<&'tcx Substs<'tcx>>)
                              -> String {
     debug!("get_symbol_hash(def_path={:?}, parameters={:?})",
-           def_path, parameters);
+           def_path, substs);
 
-    let tcx = ccx.tcx();
+    let tcx = scx.tcx();
 
-    let mut hash_state = ccx.symbol_hasher().borrow_mut();
+    let mut hasher = ty::util::TypeIdHasher::<u64>::new(tcx);
 
-    hash_state.reset();
+    record_time(&tcx.sess.perf_stats.symbol_hash_time, || {
+        // the main symbol name is not necessarily unique; hash in the
+        // compiler's internal def-path, guaranteeing each symbol has a
+        // truly unique path
+        hasher.def_path(def_path);
 
-    // the main symbol name is not necessarily unique; hash in the
-    // compiler's internal def-path, guaranteeing each symbol has a
-    // truly unique path
-    hash_state.input_str(&def_path_to_string(tcx, def_path));
+        // Include the main item-type. Note that, in this case, the
+        // assertions about `needs_subst` may not hold, but this item-type
+        // ought to be the same for every reference anyway.
+        assert!(!item_type.has_erasable_regions());
+        hasher.visit_ty(item_type);
 
-    // Include the main item-type. Note that, in this case, the
-    // assertions about `needs_subst` may not hold, but this item-type
-    // ought to be the same for every reference anyway.
-    assert!(!item_type.has_erasable_regions());
-    let encoded_item_type = tcx.sess.cstore.encode_type(tcx, item_type, def_id_to_string);
-    hash_state.input(&encoded_item_type[..]);
+        // also include any type parameters (for generic items)
+        if let Some(substs) = substs {
+            assert!(!substs.has_erasable_regions());
+            assert!(!substs.needs_subst());
+            substs.visit_with(&mut hasher);
 
-    // also include any type parameters (for generic items)
-    for t in parameters {
-       assert!(!t.has_erasable_regions());
-       assert!(!t.needs_subst());
-       let encoded_type = tcx.sess.cstore.encode_type(tcx, t, def_id_to_string);
-       hash_state.input(&encoded_type[..]);
-    }
+            // If this is an instance of a generic function, we also hash in
+            // the ID of the instantiating crate. This avoids symbol conflicts
+            // in case the same instances is emitted in two crates of the same
+            // project.
+            if substs.types().next().is_some() {
+                hasher.hash(scx.tcx().crate_name.as_str());
+                hasher.hash(scx.sess().local_crate_disambiguator().as_str());
+            }
+        }
+    });
 
-    return format!("h{}", truncated_hash_result(&mut *hash_state));
-
-    fn truncated_hash_result(symbol_hasher: &mut Sha256) -> String {
-        let output = symbol_hasher.result_bytes();
-        // 64 bits should be enough to avoid collisions.
-        output[.. 8].to_hex()
-    }
+    // 64 bits should be enough to avoid collisions.
+    format!("h{:016x}", hasher.finish())
 }
 
-fn exported_name_with_opt_suffix<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
-                                           instance: &Instance<'tcx>,
-                                           suffix: Option<&str>)
-                                           -> String {
-    let &Instance { def: mut def_id, ref substs } = instance;
+impl<'a, 'tcx> Instance<'tcx> {
+    pub fn symbol_name(self, scx: &SharedCrateContext<'a, 'tcx>) -> String {
+        let Instance { def: def_id, substs } = self;
 
-    debug!("exported_name_with_opt_suffix(def_id={:?}, substs={:?}, suffix={:?})",
-           def_id, substs, suffix);
+        debug!("symbol_name(def_id={:?}, substs={:?})",
+               def_id, substs);
 
-    if let Some(node_id) = ccx.tcx().map.as_local_node_id(def_id) {
-        if let Some(&src_def_id) = ccx.external_srcs().borrow().get(&node_id) {
-            def_id = src_def_id;
-        }
-    }
+        let node_id = scx.tcx().hir.as_local_node_id(def_id);
 
-    let def_path = ccx.tcx().def_path(def_id);
-    assert_eq!(def_path.krate, def_id.krate);
-
-    // We want to compute the "type" of this item. Unfortunately, some
-    // kinds of items (e.g., closures) don't have an entry in the
-    // item-type array. So walk back up the find the closest parent
-    // that DOES have an entry.
-    let mut ty_def_id = def_id;
-    let instance_ty;
-    loop {
-        let key = ccx.tcx().def_key(ty_def_id);
-        match key.disambiguated_data.data {
-            DefPathData::TypeNs(_) |
-            DefPathData::ValueNs(_) => {
-                instance_ty = ccx.tcx().lookup_item_type(ty_def_id);
-                break;
+        if let Some(id) = node_id {
+            if scx.sess().plugin_registrar_fn.get() == Some(id) {
+                let svh = &scx.link_meta().crate_hash;
+                let idx = def_id.index;
+                return scx.sess().generate_plugin_registrar_symbol(svh, idx);
             }
-            _ => {
-                // if we're making a symbol for something, there ought
-                // to be a value or type-def or something in there
-                // *somewhere*
-                ty_def_id.index = key.parent.unwrap_or_else(|| {
-                    panic!("finding type for {:?}, encountered def-id {:?} with no \
-                            parent", def_id, ty_def_id);
-                });
+            if scx.sess().derive_registrar_fn.get() == Some(id) {
+                let svh = &scx.link_meta().crate_hash;
+                let idx = def_id.index;
+                return scx.sess().generate_derive_registrar_symbol(svh, idx);
             }
         }
+
+        // FIXME(eddyb) Precompute a custom symbol name based on attributes.
+        let attrs = scx.tcx().get_attrs(def_id);
+        let is_foreign = if let Some(id) = node_id {
+            match scx.tcx().hir.get(id) {
+                hir_map::NodeForeignItem(_) => true,
+                _ => false
+            }
+        } else {
+            scx.sess().cstore.is_foreign_item(def_id)
+        };
+
+        if let Some(name) = weak_lang_items::link_name(&attrs) {
+            return name.to_string();
+        }
+
+        if is_foreign {
+            if let Some(name) = attr::first_attr_value_str_by_name(&attrs, "link_name") {
+                return name.to_string();
+            }
+            // Don't mangle foreign items.
+            return scx.tcx().item_name(def_id).as_str().to_string();
+        }
+
+        if let Some(name) = attr::find_export_name_attr(scx.sess().diagnostic(), &attrs) {
+            // Use provided name
+            return name.to_string();
+        }
+
+        if attr::contains_name(&attrs, "no_mangle") {
+            // Don't mangle
+            return scx.tcx().item_name(def_id).as_str().to_string();
+        }
+
+        let def_path = scx.tcx().def_path(def_id);
+
+        // We want to compute the "type" of this item. Unfortunately, some
+        // kinds of items (e.g., closures) don't have an entry in the
+        // item-type array. So walk back up the find the closest parent
+        // that DOES have an entry.
+        let mut ty_def_id = def_id;
+        let instance_ty;
+        loop {
+            let key = scx.tcx().def_key(ty_def_id);
+            match key.disambiguated_data.data {
+                DefPathData::TypeNs(_) |
+                DefPathData::ValueNs(_) => {
+                    instance_ty = scx.tcx().item_type(ty_def_id);
+                    break;
+                }
+                _ => {
+                    // if we're making a symbol for something, there ought
+                    // to be a value or type-def or something in there
+                    // *somewhere*
+                    ty_def_id.index = key.parent.unwrap_or_else(|| {
+                        bug!("finding type for {:?}, encountered def-id {:?} with no \
+                             parent", def_id, ty_def_id);
+                    });
+                }
+            }
+        }
+
+        // Erase regions because they may not be deterministic when hashed
+        // and should not matter anyhow.
+        let instance_ty = scx.tcx().erase_regions(&instance_ty);
+
+        let hash = get_symbol_hash(scx, &def_path, instance_ty, Some(substs));
+
+        let mut buffer = SymbolPathBuffer {
+            names: Vec::with_capacity(def_path.data.len())
+        };
+
+        item_path::with_forced_absolute_paths(|| {
+            scx.tcx().push_item_path(&mut buffer, def_id);
+        });
+
+        mangle(buffer.names.into_iter(), &hash)
     }
-
-    // Erase regions because they may not be deterministic when hashed
-    // and should not matter anyhow.
-    let instance_ty = ccx.tcx().erase_regions(&instance_ty.ty);
-
-    let hash = get_symbol_hash(ccx, &def_path, instance_ty, substs.types.as_slice());
-
-    let mut buffer = SymbolPathBuffer {
-        names: Vec::with_capacity(def_path.data.len())
-    };
-    ccx.tcx().push_item_path(&mut buffer, def_id);
-
-    if let Some(suffix) = suffix {
-        buffer.push(suffix);
-    }
-
-    mangle(buffer.names.into_iter(), Some(&hash[..]))
 }
 
 struct SymbolPathBuffer {
@@ -260,37 +280,21 @@ impl ItemPathBuffer for SymbolPathBuffer {
     }
 
     fn push(&mut self, text: &str) {
-        self.names.push(token::intern(text).as_str());
+        self.names.push(Symbol::intern(text).as_str());
     }
 }
 
-pub fn exported_name<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
-                               instance: &Instance<'tcx>)
-                               -> String {
-    exported_name_with_opt_suffix(ccx, instance, None)
-}
-
-pub fn exported_name_with_suffix<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
-                                           instance: &Instance<'tcx>,
-                                           suffix: &str)
-                                           -> String {
-   exported_name_with_opt_suffix(ccx, instance, Some(suffix))
-}
-
-/// Only symbols that are invisible outside their compilation unit should use a
-/// name generated by this function.
-pub fn internal_name_from_type_and_suffix<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
-                                                    t: ty::Ty<'tcx>,
-                                                    suffix: &str)
+pub fn exported_name_from_type_and_prefix<'a, 'tcx>(scx: &SharedCrateContext<'a, 'tcx>,
+                                                    t: Ty<'tcx>,
+                                                    prefix: &str)
                                                     -> String {
-    let path = [token::intern(&t.to_string()).as_str(),
-                gensym_name(suffix).as_str()];
-    let def_path = DefPath {
+    let empty_def_path = DefPath {
         data: vec![],
-        krate: cstore::LOCAL_CRATE,
+        krate: LOCAL_CRATE,
     };
-    let hash = get_symbol_hash(ccx, &def_path, t, &[]);
-    mangle(path.iter().cloned(), Some(&hash[..]))
+    let hash = get_symbol_hash(scx, &empty_def_path, t, None);
+    let path = [Symbol::intern(prefix).as_str()];
+    mangle(path.iter().cloned(), &hash)
 }
 
 // Name sanitation. LLVM will happily accept identifiers with weird names, but
@@ -343,11 +347,11 @@ pub fn sanitize(s: &str) -> String {
     return result;
 }
 
-pub fn mangle<PI: Iterator<Item=InternedString>>(path: PI, hash: Option<&str>) -> String {
+fn mangle<PI: Iterator<Item=InternedString>>(path: PI, hash: &str) -> String {
     // Follow C++ namespace-mangling style, see
     // http://en.wikipedia.org/wiki/Name_mangling for more info.
     //
-    // It turns out that on OSX you can actually have arbitrary symbols in
+    // It turns out that on macOS you can actually have arbitrary symbols in
     // function names (at least when given to LLVM), but this is not possible
     // when using unix's linker. Perhaps one day when we just use a linker from LLVM
     // we won't need to do this name mangling. The problem with name mangling is
@@ -370,9 +374,7 @@ pub fn mangle<PI: Iterator<Item=InternedString>>(path: PI, hash: Option<&str>) -
         push(&mut n, &data);
     }
 
-    if let Some(s) = hash {
-        push(&mut n, s)
-    }
+    push(&mut n, hash);
 
     n.push('E'); // End name-sequence.
     n

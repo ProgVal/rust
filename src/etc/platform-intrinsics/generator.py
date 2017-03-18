@@ -26,10 +26,9 @@ SPEC = re.compile(
 class PlatformInfo(object):
     def __init__(self, json):
         self._platform = json['platform']
-        self._intrinsic_prefix = json['intrinsic_prefix']
 
-    def intrinsic_prefix(self):
-        return self._intrinsic_prefix
+    def platform_prefix(self):
+        return self._platform
 
 class IntrinsicSet(object):
     def __init__(self, platform, json):
@@ -38,6 +37,7 @@ class IntrinsicSet(object):
         self._intrinsics = json['intrinsics']
         self._widths = json['width_info']
         self._platform = platform
+        self._intrinsic_prefix = json['intrinsic_prefix']
 
     def intrinsics(self):
         for raw in self._intrinsics:
@@ -47,6 +47,9 @@ class IntrinsicSet(object):
 
     def platform(self):
         return self._platform
+
+    def intrinsic_prefix(self):
+        return self._intrinsic_prefix
 
     def llvm_prefix(self):
         return self._llvm_prefix
@@ -116,16 +119,19 @@ class Void(Type):
     def __init__(self):
         Type.__init__(self, 0)
 
-    def compiler_ctor(self):
+    @staticmethod
+    def compiler_ctor():
         return '::VOID'
 
     def compiler_ctor_ref(self):
         return '&' + self.compiler_ctor()
 
-    def rust_name(self):
+    @staticmethod
+    def rust_name():
         return '()'
 
-    def type_info(self, platform_info):
+    @staticmethod
+    def type_info(platform_info):
         return None
 
     def __eq__(self, other):
@@ -279,7 +285,7 @@ class Vector(Type):
 
 class Pointer(Type):
     def __init__(self, elem, llvm_elem, const):
-        self._elem = elem;
+        self._elem = elem
         self._llvm_elem = llvm_elem
         self._const = const
         Type.__init__(self, BITWIDTH_POINTER)
@@ -500,7 +506,7 @@ class GenericIntrinsic(object):
             # must be a power of two
             assert width & (width - 1) == 0
             def recur(processed, untouched):
-                if untouched == []:
+                if not untouched:
                     ret = processed[0]
                     args = processed[1:]
                     yield MonomorphicIntrinsic(self._platform, self.intrinsic, width,
@@ -538,8 +544,14 @@ class MonomorphicIntrinsic(object):
                                       *self._args,
                                       width = self._width)
 
+    def platform_prefix(self):
+        return self._platform.platform().platform_prefix()
+
+    def intrinsic_set_name(self):
+        return self._platform.intrinsic_prefix()
+
     def intrinsic_name(self):
-        return self._platform.platform().intrinsic_prefix() + self.intrinsic_suffix()
+        return self._platform.intrinsic_prefix() + self.intrinsic_suffix()
 
     def compiler_args(self):
         return ', '.join(arg.compiler_ctor_ref() for arg in self._args_raw)
@@ -561,6 +573,27 @@ def parse_args():
         formatter_class = argparse.RawDescriptionHelpFormatter,
         description = 'Render an intrinsic definition JSON to various formats.',
         epilog = textwrap.dedent('''\
+        Quick How-To:
+
+        There are two operating modes: single file and multiple files.
+
+        For example, ARM is specified as a single file. To generate the
+        compiler-definitions for ARM just pass the script the "arm.json" file:
+
+        python generator.py --format compiler-defs arm.json
+
+        The X86 architecture is specified as multiple files (for the different
+        instruction sets that x86 supports). To generate the compiler
+        definitions one needs to pass the script a "platform information file"
+        (with the -i flag) next to the files of the different intruction sets.
+        For example, to generate the X86 compiler-definitions for SSE4.2, just:
+
+        python generator.py --format compiler-defs -i x86/info.json sse42.json
+
+        And to generate the compiler-definitions for SSE4.1 and SSE4.2, just:
+
+        python generator.py --format compiler-defs -i x86/info.json sse41.json sse42.json
+
         An intrinsic definition consists of a map with fields:
         - intrinsic: pattern for the name(s) of the vendor's C intrinsic(s)
         - llvm: pattern for the name(s) of the internal llvm intrinsic(s)
@@ -726,21 +759,26 @@ class ExternBlock(object):
     def __init__(self):
         pass
 
-    def open(self, platform):
+    @staticmethod
+    def open(platform):
         return 'extern "platform-intrinsic" {'
 
-    def render(self, mono):
-        return '    fn {}{};'.format(mono.intrinsic_name(),
-                                     mono.intrinsic_signature())
+    @staticmethod
+    def render(mono):
+        return '    fn {}{}{};'.format(mono.platform_prefix(),
+                                       mono.intrinsic_name(),
+                                       mono.intrinsic_signature())
 
-    def close(self):
+    @staticmethod
+    def close():
         return '}'
 
 class CompilerDefs(object):
     def __init__(self):
         pass
 
-    def open(self, platform):
+    @staticmethod
+    def open(platform):
         return '''\
 // Copyright 2015 The Rust Project Developers. See the COPYRIGHT
 // file at the top-level directory of this distribution and at
@@ -765,21 +803,23 @@ use IntrinsicDef::Named;
 #[inline(never)]
 pub fn find(name: &str) -> Option<Intrinsic> {{
     if !name.starts_with("{0}") {{ return None }}
-    Some(match &name["{0}".len()..] {{'''.format(platform.intrinsic_prefix())
+    Some(match &name["{0}".len()..] {{'''.format(platform.platform_prefix())
 
-    def render(self, mono):
+    @staticmethod
+    def render(mono):
         return '''\
         "{}" => Intrinsic {{
             inputs: {{ static INPUTS: [&'static Type; {}] = [{}]; &INPUTS }},
             output: {},
             definition: Named("{}")
-        }},'''.format(mono.intrinsic_suffix(),
+        }},'''.format(mono.intrinsic_set_name() + mono.intrinsic_suffix(),
                       len(mono._args_raw),
                       mono.compiler_args(),
                       mono.compiler_ret(),
                       mono.llvm_name())
 
-    def close(self):
+    @staticmethod
+    def close():
         return '''\
         _ => return None,
     })

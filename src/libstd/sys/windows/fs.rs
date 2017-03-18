@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use prelude::v1::*;
-use io::prelude::*;
 use os::windows::prelude::*;
 
 use ffi::OsString;
@@ -39,7 +37,7 @@ pub struct FileAttr {
     reparse_tag: c::DWORD,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FileType {
     Dir, File, SymlinkFile, SymlinkDir, ReparsePoint, MountPoint,
 }
@@ -60,7 +58,7 @@ pub struct DirEntry {
     data: c::WIN32_FIND_DATAW,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OpenOptions {
     // generic
     read: bool,
@@ -81,7 +79,16 @@ pub struct OpenOptions {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FilePermissions { attrs: c::DWORD }
 
+#[derive(Debug)]
 pub struct DirBuilder;
+
+impl fmt::Debug for ReadDir {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // This will only be called from std::fs::ReadDir, which will add a "ReadDir()" frame.
+        // Thus the result will be e g 'ReadDir("C:\")'
+        fmt::Debug::fmt(&*self.root, f)
+    }
+}
 
 impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
@@ -120,8 +127,8 @@ impl DirEntry {
     fn new(root: &Arc<PathBuf>, wfd: &c::WIN32_FIND_DATAW) -> Option<DirEntry> {
         match &wfd.cFileName[0..3] {
             // check for '.' and '..'
-            [46, 0, ..] |
-            [46, 46, 0, ..] => return None,
+            &[46, 0, ..] |
+            &[46, 46, 0, ..] => return None,
             _ => {}
         }
 
@@ -202,7 +209,7 @@ impl OpenOptions {
         const ERROR_INVALID_PARAMETER: i32 = 87;
 
         match (self.read, self.write, self.append, self.access_mode) {
-            (_, _, _, Some(mode)) => Ok(mode),
+            (.., Some(mode)) => Ok(mode),
             (true,  false, false, None) => Ok(c::GENERIC_READ),
             (false, true,  false, None) => Ok(c::GENERIC_WRITE),
             (true,  true,  false, None) => Ok(c::GENERIC_READ | c::GENERIC_WRITE),
@@ -313,6 +320,10 @@ impl File {
         self.handle.read(buf)
     }
 
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.handle.read_at(buf, offset)
+    }
+
     pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
         self.handle.read_to_end(buf)
     }
@@ -321,10 +332,16 @@ impl File {
         self.handle.write(buf)
     }
 
+    pub fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        self.handle.write_at(buf, offset)
+    }
+
     pub fn flush(&self) -> io::Result<()> { Ok(()) }
 
     pub fn seek(&self, pos: SeekFrom) -> io::Result<u64> {
         let (whence, pos) = match pos {
+            // Casting to `i64` is fine, `SetFilePointerEx` reinterprets this
+            // integer as `u64`.
             SeekFrom::Start(n) => (c::FILE_BEGIN, n as i64),
             SeekFrom::End(n) => (c::FILE_END, n),
             SeekFrom::Current(n) => (c::FILE_CURRENT, n),
@@ -400,6 +417,24 @@ impl File {
             }
             Ok(PathBuf::from(OsString::from_wide(subst)))
         }
+    }
+
+    pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
+        let mut info = c::FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: 0,
+            FileAttributes: perm.attrs,
+        };
+        let size = mem::size_of_val(&info);
+        cvt(unsafe {
+            c::SetFileInformationByHandle(self.handle.raw(),
+                                          c::FileBasicInfo,
+                                          &mut info as *mut _ as *mut _,
+                                          size as c::DWORD)
+        })?;
+        Ok(())
     }
 }
 
@@ -611,9 +646,25 @@ pub fn symlink_inner(src: &Path, dst: &Path, dir: bool) -> io::Result<()> {
     let src = to_u16s(src)?;
     let dst = to_u16s(dst)?;
     let flags = if dir { c::SYMBOLIC_LINK_FLAG_DIRECTORY } else { 0 };
-    cvt(unsafe {
-        c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) as c::BOOL
-    })?;
+    // Formerly, symlink creation required the SeCreateSymbolicLink privilege. For the Windows 10
+    // Creators Update, Microsoft loosened this to allow unprivileged symlink creation if the
+    // computer is in Developer Mode, but SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE must be
+    // added to dwFlags to opt into this behaviour.
+    let result = cvt(unsafe {
+        c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(),
+                               flags | c::SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) as c::BOOL
+    });
+    if let Err(err) = result {
+        if err.raw_os_error() == Some(c::ERROR_INVALID_PARAMETER as i32) {
+            // Older Windows objects to SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            // so if we encounter ERROR_INVALID_PARAMETER, retry without that flag.
+            cvt(unsafe {
+                c::CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) as c::BOOL
+            })?;
+        } else {
+            return Err(err);
+        }
+    }
     Ok(())
 }
 

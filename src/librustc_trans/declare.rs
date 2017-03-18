@@ -19,16 +19,20 @@
 //!   interested in defining the ValueRef they return.
 //! * Use define_* family of methods when you might be defining the ValueRef.
 //! * When in doubt, define.
+
 use llvm::{self, ValueRef};
+use llvm::AttributePlace::Function;
 use rustc::ty;
-use rustc::infer;
+use rustc::session::config::Sanitizer;
 use abi::{Abi, FnType};
 use attributes;
 use context::CrateContext;
+use common;
 use type_::Type;
+use value::Value;
+use syntax::attr;
 
 use std::ffi::CString;
-use libc::c_uint;
 
 
 /// Declare a global value.
@@ -38,10 +42,10 @@ use libc::c_uint;
 pub fn declare_global(ccx: &CrateContext, name: &str, ty: Type) -> llvm::ValueRef {
     debug!("declare_global(name={:?})", name);
     let namebuf = CString::new(name).unwrap_or_else(|_|{
-        ccx.sess().bug(&format!("name {:?} contains an interior null byte", name))
+        bug!("name {:?} contains an interior null byte", name)
     });
     unsafe {
-        llvm::LLVMGetOrInsertGlobal(ccx.llmod(), namebuf.as_ptr(), ty.to_ref())
+        llvm::LLVMRustGetOrInsertGlobal(ccx.llmod(), namebuf.as_ptr(), ty.to_ref())
     }
 }
 
@@ -53,10 +57,10 @@ pub fn declare_global(ccx: &CrateContext, name: &str, ty: Type) -> llvm::ValueRe
 fn declare_raw_fn(ccx: &CrateContext, name: &str, callconv: llvm::CallConv, ty: Type) -> ValueRef {
     debug!("declare_raw_fn(name={:?}, ty={:?})", name, ty);
     let namebuf = CString::new(name).unwrap_or_else(|_|{
-        ccx.sess().bug(&format!("name {:?} contains an interior null byte", name))
+        bug!("name {:?} contains an interior null byte", name)
     });
     let llfn = unsafe {
-        llvm::LLVMGetOrInsertFunction(ccx.llmod(), namebuf.as_ptr(), ty.to_ref())
+        llvm::LLVMRustGetOrInsertFunction(ccx.llmod(), namebuf.as_ptr(), ty.to_ref())
     };
 
     llvm::SetFunctionCallConv(llfn, callconv);
@@ -66,7 +70,43 @@ fn declare_raw_fn(ccx: &CrateContext, name: &str, callconv: llvm::CallConv, ty: 
 
     if ccx.tcx().sess.opts.cg.no_redzone
         .unwrap_or(ccx.tcx().sess.target.target.options.disable_redzone) {
-        llvm::SetFunctionAttribute(llfn, llvm::Attribute::NoRedZone)
+        llvm::Attribute::NoRedZone.apply_llfn(Function, llfn);
+    }
+
+    if let Some(ref sanitizer) = ccx.tcx().sess.opts.debugging_opts.sanitizer {
+        match *sanitizer {
+            Sanitizer::Address => {
+                llvm::Attribute::SanitizeAddress.apply_llfn(Function, llfn);
+            },
+            Sanitizer::Memory => {
+                llvm::Attribute::SanitizeMemory.apply_llfn(Function, llfn);
+            },
+            Sanitizer::Thread => {
+                llvm::Attribute::SanitizeThread.apply_llfn(Function, llfn);
+            },
+            _ => {}
+        }
+    }
+
+    // If we're compiling the compiler-builtins crate, e.g. the equivalent of
+    // compiler-rt, then we want to implicitly compile everything with hidden
+    // visibility as we're going to link this object all over the place but
+    // don't want the symbols to get exported.
+    if attr::contains_name(ccx.tcx().hir.krate_attrs(), "compiler_builtins") {
+        unsafe {
+            llvm::LLVMRustSetVisibility(llfn, llvm::Visibility::Hidden);
+        }
+    }
+
+    match ccx.tcx().sess.opts.cg.opt_level.as_ref().map(String::as_ref) {
+        Some("s") => {
+            llvm::Attribute::OptimizeForSize.apply_llfn(Function, llfn);
+        },
+        Some("z") => {
+            llvm::Attribute::MinSize.apply_llfn(Function, llfn);
+            llvm::Attribute::OptimizeForSize.apply_llfn(Function, llfn);
+        },
+        _ => {},
     }
 
     llfn
@@ -92,19 +132,19 @@ pub fn declare_cfn(ccx: &CrateContext, name: &str, fn_type: Type) -> ValueRef {
 pub fn declare_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>, name: &str,
                             fn_type: ty::Ty<'tcx>) -> ValueRef {
     debug!("declare_rust_fn(name={:?}, fn_type={:?})", name, fn_type);
-    let abi = fn_type.fn_abi();
-    let sig = ccx.tcx().erase_late_bound_regions(fn_type.fn_sig());
-    let sig = infer::normalize_associated_type(ccx.tcx(), &sig);
+    let sig = common::ty_fn_sig(ccx, fn_type);
+    let sig = ccx.tcx().erase_late_bound_regions_and_normalize(&sig);
     debug!("declare_rust_fn (after region erasure) sig={:?}", sig);
 
-    let fty = FnType::new(ccx, abi, &sig, &[]);
+    let fty = FnType::new(ccx, sig, &[]);
     let llfn = declare_raw_fn(ccx, name, fty.cconv, fty.llvm_type(ccx));
 
-    if sig.output == ty::FnDiverging {
-        llvm::SetFunctionAttribute(llfn, llvm::Attribute::NoReturn);
+    // FIXME(canndrew): This is_never should really be an is_uninhabited
+    if sig.output().is_never() {
+        llvm::Attribute::NoReturn.apply_llfn(Function, llfn);
     }
 
-    if abi != Abi::Rust && abi != Abi::RustCall {
+    if sig.abi != Abi::Rust && sig.abi != Abi::RustCall {
         attributes::unwind(llfn, false);
     }
 
@@ -128,6 +168,20 @@ pub fn define_global(ccx: &CrateContext, name: &str, ty: Type) -> Option<ValueRe
     }
 }
 
+/// Declare a Rust function with an intention to define it.
+///
+/// Use this function when you intend to define a function. This function will
+/// return panic if the name already has a definition associated with it. This
+/// can happen with #[no_mangle] or #[export_name], for example.
+pub fn define_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
+                           name: &str,
+                           fn_type: ty::Ty<'tcx>) -> ValueRef {
+    if get_defined_value(ccx, name).is_some() {
+        ccx.sess().fatal(&format!("symbol `{}` already defined", name))
+    } else {
+        declare_fn(ccx, name, fn_type)
+    }
+}
 
 /// Declare a Rust function with an intention to define it.
 ///
@@ -137,39 +191,39 @@ pub fn define_global(ccx: &CrateContext, name: &str, ty: Type) -> Option<ValueRe
 pub fn define_internal_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
                                     name: &str,
                                     fn_type: ty::Ty<'tcx>) -> ValueRef {
-    if get_defined_value(ccx, name).is_some() {
-        ccx.sess().fatal(&format!("symbol `{}` already defined", name))
-    } else {
-        let llfn = declare_fn(ccx, name, fn_type);
-        llvm::SetLinkage(llfn, llvm::InternalLinkage);
-        llfn
-    }
+    let llfn = define_fn(ccx, name, fn_type);
+    unsafe { llvm::LLVMRustSetLinkage(llfn, llvm::Linkage::InternalLinkage) };
+    llfn
 }
 
+
+/// Get declared value by name.
+pub fn get_declared_value(ccx: &CrateContext, name: &str) -> Option<ValueRef> {
+    debug!("get_declared_value(name={:?})", name);
+    let namebuf = CString::new(name).unwrap_or_else(|_|{
+        bug!("name {:?} contains an interior null byte", name)
+    });
+    let val = unsafe { llvm::LLVMRustGetNamedValue(ccx.llmod(), namebuf.as_ptr()) };
+    if val.is_null() {
+        debug!("get_declared_value: {:?} value is null", name);
+        None
+    } else {
+        debug!("get_declared_value: {:?} => {:?}", name, Value(val));
+        Some(val)
+    }
+}
 
 /// Get defined or externally defined (AvailableExternally linkage) value by
 /// name.
 pub fn get_defined_value(ccx: &CrateContext, name: &str) -> Option<ValueRef> {
-    debug!("get_defined_value(name={:?})", name);
-    let namebuf = CString::new(name).unwrap_or_else(|_|{
-        ccx.sess().bug(&format!("name {:?} contains an interior null byte", name))
-    });
-    let val = unsafe { llvm::LLVMGetNamedValue(ccx.llmod(), namebuf.as_ptr()) };
-    if val.is_null() {
-        debug!("get_defined_value: {:?} value is null", name);
-        None
-    } else {
-        let (declaration, aext_link) = unsafe {
-            let linkage = llvm::LLVMGetLinkage(val);
-            (llvm::LLVMIsDeclaration(val) != 0,
-             linkage == llvm::AvailableExternallyLinkage as c_uint)
+    get_declared_value(ccx, name).and_then(|val|{
+        let declaration = unsafe {
+            llvm::LLVMIsDeclaration(val) != 0
         };
-        debug!("get_defined_value: found {:?} value (declaration: {}, \
-                aext_link: {})", name, declaration, aext_link);
-        if !declaration || aext_link {
+        if !declaration {
             Some(val)
         } else {
             None
         }
-    }
+    })
 }

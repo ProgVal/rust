@@ -8,10 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![feature(fn_traits)]
+
 // That a closure whose expected argument types include two distinct
 // bound regions.
-
-#![feature(unboxed_closures)]
 
 use std::cell::Cell;
 

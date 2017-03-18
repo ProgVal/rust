@@ -10,75 +10,34 @@
 
 use libc::c_uint;
 use llvm;
-use llvm::{Integer, Pointer, Float, Double, Struct, Array};
-use abi::{FnType, ArgType};
+use llvm::{Integer, Pointer, Float, Double, Vector};
+use abi::{self, align_up_to, FnType, ArgType};
 use context::CrateContext;
 use type_::Type;
 
 use std::cmp;
 
-fn align_up_to(off: usize, a: usize) -> usize {
-    return (off + a - 1) / a * a;
-}
-
-fn align(off: usize, ty: Type) -> usize {
-    let a = ty_align(ty);
-    return align_up_to(off, a);
-}
-
 fn ty_align(ty: Type) -> usize {
-    match ty.kind() {
-        Integer => {
-            unsafe {
-                ((llvm::LLVMGetIntTypeWidth(ty.to_ref()) as usize) + 7) / 8
-            }
-        }
-        Pointer => 4,
-        Float => 4,
-        Double => 8,
-        Struct => {
-          if ty.is_packed() {
-            1
-          } else {
-            let str_tys = ty.field_types();
-            str_tys.iter().fold(1, |a, t| cmp::max(a, ty_align(*t)))
-          }
-        }
-        Array => {
-            let elt = ty.element_type();
-            ty_align(elt)
-        }
-        _ => panic!("ty_size: unhandled type")
+    if ty.kind() == Vector {
+        bug!("ty_size: unhandled type")
+    } else {
+        abi::ty_align(ty, 4)
     }
 }
 
 fn ty_size(ty: Type) -> usize {
-    match ty.kind() {
-        Integer => {
-            unsafe {
-                ((llvm::LLVMGetIntTypeWidth(ty.to_ref()) as usize) + 7) / 8
-            }
-        }
-        Pointer => 4,
-        Float => 4,
-        Double => 8,
-        Struct => {
-            if ty.is_packed() {
-                let str_tys = ty.field_types();
-                str_tys.iter().fold(0, |s, t| s + ty_size(*t))
-            } else {
-                let str_tys = ty.field_types();
-                let size = str_tys.iter().fold(0, |s, t| align(s, *t) + ty_size(*t));
-                align(size, ty)
-            }
-        }
-        Array => {
-            let len = ty.array_length();
-            let elt = ty.element_type();
-            let eltsz = ty_size(elt);
-            len * eltsz
-        }
-        _ => panic!("ty_size: unhandled type")
+    if ty.kind() == Vector {
+        bug!("ty_size: unhandled type")
+    } else {
+        abi::ty_size(ty, 4)
+    }
+}
+
+fn classify_ret_ty(ccx: &CrateContext, ret: &mut ArgType) {
+    if is_reg_ty(ret.ty) {
+        ret.extend_integer_width_to(32);
+    } else {
+        ret.make_indirect(ccx);
     }
 }
 
@@ -94,6 +53,8 @@ fn classify_arg_ty(ccx: &CrateContext, arg: &mut ArgType, offset: &mut usize) {
     if !is_reg_ty(arg.ty) {
         arg.cast = Some(struct_ty(ccx, arg.ty));
         arg.pad = padding_ty(ccx, align, orig_offset);
+    } else {
+        arg.extend_integer_width_to(32);
     }
 }
 
@@ -141,8 +102,8 @@ fn struct_ty(ccx: &CrateContext, ty: Type) -> Type {
 }
 
 pub fn compute_abi_info(ccx: &CrateContext, fty: &mut FnType) {
-    if !fty.ret.is_ignore() && !is_reg_ty(fty.ret.ty) {
-        fty.ret.make_indirect(ccx);
+    if !fty.ret.is_ignore() {
+        classify_ret_ty(ccx, &mut fty.ret);
     }
 
     let mut offset = if fty.ret.is_indirect() { 4 } else { 0 };

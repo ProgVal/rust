@@ -16,13 +16,13 @@ impl std::ops::Neg for S {
     fn neg(self) -> u32 { 0 }
 }
 
-const _MAX: usize = -1;
-//~^ ERROR unary negation of unsigned integer
-//~| HELP use a cast or the `!` operator
-
 fn main() {
+    let _max: usize = -1;
+    //~^ ERROR cannot apply unary operator `-` to type `usize`
+
     let x = 5u8;
-    let _y = -x; //~ ERROR unary negation of unsigned integer
-    //~^ HELP use a cast or the `!` operator
+    let _y = -x;
+    //~^ ERROR cannot apply unary operator `-` to type `u8`
+
     -S; // should not trigger the gate; issue 26840
 }

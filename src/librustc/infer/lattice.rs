@@ -29,26 +29,29 @@
 //! over a `LatticeValue`, which is a value defined with respect to
 //! a lattice.
 
-use super::combine;
 use super::InferCtxt;
+use super::type_variable::TypeVariableOrigin;
 
+use traits::ObligationCause;
 use ty::TyVar;
 use ty::{self, Ty};
 use ty::relate::{RelateResult, TypeRelation};
 
-pub trait LatticeDir<'f,'tcx> : TypeRelation<'f,'tcx> {
-    fn infcx(&self) -> &'f InferCtxt<'f, 'tcx>;
+pub trait LatticeDir<'f, 'gcx: 'f+'tcx, 'tcx: 'f> : TypeRelation<'f, 'gcx, 'tcx> {
+    fn infcx(&self) -> &'f InferCtxt<'f, 'gcx, 'tcx>;
+
+    fn cause(&self) -> &ObligationCause<'tcx>;
 
     // Relates the type `v` to `a` and `b` such that `v` represents
     // the LUB/GLB of `a` and `b` as appropriate.
-    fn relate_bound(&self, v: Ty<'tcx>, a: Ty<'tcx>, b: Ty<'tcx>) -> RelateResult<'tcx, ()>;
+    fn relate_bound(&mut self, v: Ty<'tcx>, a: Ty<'tcx>, b: Ty<'tcx>) -> RelateResult<'tcx, ()>;
 }
 
-pub fn super_lattice_tys<'a,'tcx,L:LatticeDir<'a,'tcx>>(this: &mut L,
-                                                        a: Ty<'tcx>,
-                                                        b: Ty<'tcx>)
-                                                        -> RelateResult<'tcx, Ty<'tcx>>
-    where 'tcx: 'a
+pub fn super_lattice_tys<'a, 'gcx, 'tcx, L>(this: &mut L,
+                                            a: Ty<'tcx>,
+                                            b: Ty<'tcx>)
+                                            -> RelateResult<'tcx, Ty<'tcx>>
+    where L: LatticeDir<'a, 'gcx, 'tcx>, 'gcx: 'a+'tcx, 'tcx: 'a
 {
     debug!("{}.lattice_tys({:?}, {:?})",
            this.tag(),
@@ -65,20 +68,21 @@ pub fn super_lattice_tys<'a,'tcx,L:LatticeDir<'a,'tcx>>(this: &mut L,
     match (&a.sty, &b.sty) {
         (&ty::TyInfer(TyVar(..)), &ty::TyInfer(TyVar(..)))
             if infcx.type_var_diverges(a) && infcx.type_var_diverges(b) => {
-            let v = infcx.next_diverging_ty_var();
+            let v = infcx.next_diverging_ty_var(
+                TypeVariableOrigin::LatticeVariable(this.cause().span));
             this.relate_bound(v, a, b)?;
             Ok(v)
         }
 
         (&ty::TyInfer(TyVar(..)), _) |
         (_, &ty::TyInfer(TyVar(..))) => {
-            let v = infcx.next_ty_var();
+            let v = infcx.next_ty_var(TypeVariableOrigin::LatticeVariable(this.cause().span));
             this.relate_bound(v, a, b)?;
             Ok(v)
         }
 
         _ => {
-            combine::super_combine_tys(this.infcx(), this, a, b)
+            infcx.super_combine_tys(this, a, b)
         }
     }
 }

@@ -64,7 +64,9 @@
 // You'll find a few more details in the implementation, but that's the gist of
 // it!
 
+use fmt;
 use marker;
+use ptr;
 use sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use thread::{self, Thread};
 
@@ -101,7 +103,8 @@ unsafe impl Send for Once {}
 
 /// State yielded to the `call_once_force` method which can be used to query
 /// whether the `Once` was previously poisoned or not.
-#[unstable(feature = "once_poison", issue = "31688")]
+#[unstable(feature = "once_poison", issue = "33577")]
+#[derive(Debug)]
 pub struct OnceState {
     poisoned: bool,
 }
@@ -218,8 +221,7 @@ impl Once {
     /// The closure `f` is yielded a structure which can be used to query the
     /// state of this `Once` (whether initialization has previously panicked or
     /// not).
-    /// poisoned or not.
-    #[unstable(feature = "once_poison", issue = "31688")]
+    #[unstable(feature = "once_poison", issue = "33577")]
     pub fn call_once_force<F>(&'static self, f: F) where F: FnOnce(&OnceState) {
         // same as above, just with a different parameter to `call_inner`.
         if self.state.load(Ordering::SeqCst) == COMPLETE {
@@ -298,7 +300,7 @@ impl Once {
                     let mut node = Waiter {
                         thread: Some(thread::current()),
                         signaled: AtomicBool::new(false),
-                        next: 0 as *mut Waiter,
+                        next: ptr::null_mut(),
                     };
                     let me = &mut node as *mut Waiter as usize;
                     assert!(me & STATE_MASK == 0);
@@ -314,7 +316,7 @@ impl Once {
                         }
 
                         // Once we've enqueued ourselves, wait in a loop.
-                        // Aftewards reload the state and continue with what we
+                        // Afterwards reload the state and continue with what we
                         // were doing from before.
                         while !node.signaled.load(Ordering::SeqCst) {
                             thread::park();
@@ -325,6 +327,13 @@ impl Once {
                 }
             }
         }
+    }
+}
+
+#[stable(feature = "std_debug", since = "1.16.0")]
+impl fmt::Debug for Once {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.pad("Once { .. }")
     }
 }
 
@@ -361,16 +370,14 @@ impl OnceState {
     ///
     /// Once an initalization routine for a `Once` has panicked it will forever
     /// indicate to future forced initialization routines that it is poisoned.
-    #[unstable(feature = "once_poison", issue = "31688")]
+    #[unstable(feature = "once_poison", issue = "33577")]
     pub fn poisoned(&self) -> bool {
         self.poisoned
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "emscripten")))]
 mod tests {
-    use prelude::v1::*;
-
     use panic;
     use sync::mpsc::channel;
     use thread;
@@ -389,7 +396,7 @@ mod tests {
     #[test]
     fn stampede_once() {
         static O: Once = Once::new();
-        static mut run: bool = false;
+        static mut RUN: bool = false;
 
         let (tx, rx) = channel();
         for _ in 0..10 {
@@ -398,10 +405,10 @@ mod tests {
                 for _ in 0..4 { thread::yield_now() }
                 unsafe {
                     O.call_once(|| {
-                        assert!(!run);
-                        run = true;
+                        assert!(!RUN);
+                        RUN = true;
                     });
-                    assert!(run);
+                    assert!(RUN);
                 }
                 tx.send(()).unwrap();
             });
@@ -409,10 +416,10 @@ mod tests {
 
         unsafe {
             O.call_once(|| {
-                assert!(!run);
-                run = true;
+                assert!(!RUN);
+                RUN = true;
             });
-            assert!(run);
+            assert!(RUN);
         }
 
         for _ in 0..10 {
@@ -425,13 +432,13 @@ mod tests {
         static O: Once = Once::new();
 
         // poison the once
-        let t = panic::recover(|| {
+        let t = panic::catch_unwind(|| {
             O.call_once(|| panic!());
         });
         assert!(t.is_err());
 
         // poisoning propagates
-        let t = panic::recover(|| {
+        let t = panic::catch_unwind(|| {
             O.call_once(|| {});
         });
         assert!(t.is_err());
@@ -453,7 +460,7 @@ mod tests {
         static O: Once = Once::new();
 
         // poison the once
-        let t = panic::recover(|| {
+        let t = panic::catch_unwind(|| {
             O.call_once(|| panic!());
         });
         assert!(t.is_err());

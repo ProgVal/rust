@@ -15,15 +15,14 @@ use llvm::{TypeRef, Bool, False, True, TypeKind};
 use llvm::{Float, Double, X86_FP80, PPC_FP128, FP128};
 
 use context::CrateContext;
-use util::nodemap::FnvHashMap;
 
 use syntax::ast;
+use rustc::ty::layout;
 
 use std::ffi::CString;
 use std::fmt;
 use std::mem;
 use std::ptr;
-use std::cell::RefCell;
 
 use libc::c_uint;
 
@@ -36,7 +35,7 @@ pub struct Type {
 impl fmt::Debug for Type {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&llvm::build_string(|s| unsafe {
-            llvm::LLVMWriteTypeToString(self.to_ref(), s);
+            llvm::LLVMRustWriteTypeToString(self.to_ref(), s);
         }).expect("non-UTF8 type description from LLVM"))
     }
 }
@@ -72,7 +71,7 @@ impl Type {
     }
 
     pub fn metadata(ccx: &CrateContext) -> Type {
-        ty!(llvm::LLVMMetadataTypeInContext(ccx.llcx()))
+        ty!(llvm::LLVMRustMetadataTypeInContext(ccx.llcx()))
     }
 
     pub fn i1(ccx: &CrateContext) -> Type {
@@ -93,6 +92,10 @@ impl Type {
 
     pub fn i64(ccx: &CrateContext) -> Type {
         ty!(llvm::LLVMInt64TypeInContext(ccx.llcx()))
+    }
+
+    pub fn i128(ccx: &CrateContext) -> Type {
+        ty!(llvm::LLVMIntTypeInContext(ccx.llcx(), 128))
     }
 
     // Creates an integer type with the given number of bits, e.g. i24
@@ -122,9 +125,10 @@ impl Type {
 
     pub fn int(ccx: &CrateContext) -> Type {
         match &ccx.tcx().sess.target.target.target_pointer_width[..] {
+            "16" => Type::i16(ccx),
             "32" => Type::i32(ccx),
             "64" => Type::i64(ccx),
-            tws => panic!("Unsupported target word size for int: {}", tws),
+            tws => bug!("Unsupported target word size for int: {}", tws),
         }
     }
 
@@ -134,7 +138,8 @@ impl Type {
             ast::IntTy::I8 => Type::i8(ccx),
             ast::IntTy::I16 => Type::i16(ccx),
             ast::IntTy::I32 => Type::i32(ccx),
-            ast::IntTy::I64 => Type::i64(ccx)
+            ast::IntTy::I64 => Type::i64(ccx),
+            ast::IntTy::I128 => Type::i128(ccx),
         }
     }
 
@@ -144,7 +149,8 @@ impl Type {
             ast::UintTy::U8 => Type::i8(ccx),
             ast::UintTy::U16 => Type::i16(ccx),
             ast::UintTy::U32 => Type::i32(ccx),
-            ast::UintTy::U64 => Type::i64(ccx)
+            ast::UintTy::U64 => Type::i64(ccx),
+            ast::UintTy::U128 => Type::i128(ccx),
         }
     }
 
@@ -207,7 +213,7 @@ impl Type {
 
     pub fn kind(&self) -> TypeKind {
         unsafe {
-            llvm::LLVMGetTypeKind(self.to_ref())
+            llvm::LLVMRustGetTypeKind(self.to_ref())
         }
     }
 
@@ -288,7 +294,7 @@ impl Type {
             Double => 64,
             X86_FP80 => 80,
             FP128 | PPC_FP128 => 128,
-            _ => panic!("llvm_float_width called on a non-float type")
+            _ => bug!("llvm_float_width called on a non-float type")
         }
     }
 
@@ -298,27 +304,25 @@ impl Type {
             llvm::LLVMGetIntTypeWidth(self.to_ref()) as u64
         }
     }
-}
 
-/* Memory-managed object interface to type handles. */
-
-pub struct TypeNames {
-    named_types: RefCell<FnvHashMap<String, TypeRef>>,
-}
-
-impl TypeNames {
-    pub fn new() -> TypeNames {
-        TypeNames {
-            named_types: RefCell::new(FnvHashMap())
+    pub fn from_integer(cx: &CrateContext, i: layout::Integer) -> Type {
+        use rustc::ty::layout::Integer::*;
+        match i {
+            I1 => Type::i1(cx),
+            I8 => Type::i8(cx),
+            I16 => Type::i16(cx),
+            I32 => Type::i32(cx),
+            I64 => Type::i64(cx),
+            I128 => Type::i128(cx),
         }
     }
 
-    pub fn associate_type(&self, s: &str, t: &Type) {
-        assert!(self.named_types.borrow_mut().insert(s.to_string(),
-                                                     t.to_ref()).is_none());
-    }
-
-    pub fn find_type(&self, s: &str) -> Option<Type> {
-        self.named_types.borrow().get(s).map(|x| Type::from_ref(*x))
+    pub fn from_primitive(ccx: &CrateContext, p: layout::Primitive) -> Type {
+        match p {
+            layout::Int(i) => Type::from_integer(ccx, i),
+            layout::F32 => Type::f32(ccx),
+            layout::F64 => Type::f64(ccx),
+            layout::Pointer => bug!("It is not possible to convert Pointer directly to Type.")
+        }
     }
 }

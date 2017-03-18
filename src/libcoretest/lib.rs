@@ -10,38 +10,36 @@
 
 #![deny(warnings)]
 
-#![feature(as_unsafe_cell)]
-#![feature(borrow_state)]
 #![feature(box_syntax)]
-#![feature(cell_extras)]
+#![feature(char_escape_debug)]
 #![feature(const_fn)]
-#![feature(copy_from_slice)]
-#![feature(core_float)]
 #![feature(core_private_bignum)]
 #![feature(core_private_diy_float)]
 #![feature(dec2flt)]
-#![feature(decode_utf16)]
+#![feature(decode_utf8)]
 #![feature(fixed_size_array)]
-#![feature(float_extras)]
 #![feature(flt2dec)]
-#![feature(iter_arith)]
 #![feature(libc)]
 #![feature(nonzero)]
-#![feature(peekable_is_empty)]
-#![feature(ptr_as_ref)]
 #![feature(rand)]
 #![feature(raw)]
+#![feature(result_expect_err)]
+#![feature(sip_hash_13)]
 #![feature(slice_patterns)]
 #![feature(step_by)]
 #![feature(test)]
-#![feature(unboxed_closures)]
+#![feature(try_from)]
 #![feature(unicode)]
 #![feature(unique)]
+#![feature(ordering_chaining)]
+#![feature(ptr_unaligned)]
+#![feature(move_cell)]
+#![feature(fmt_internals)]
 
 extern crate core;
 extern crate test;
 extern crate libc;
-extern crate rustc_unicode;
+extern crate std_unicode;
 extern crate rand;
 
 mod any;

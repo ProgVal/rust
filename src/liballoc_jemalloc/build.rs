@@ -8,21 +8,39 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![deny(warnings)]
+
 extern crate build_helper;
 extern crate gcc;
 
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
-use build_helper::run;
+use build_helper::{run, native_lib_boilerplate};
 
 fn main() {
-    println!("cargo:rustc-cfg=cargobuild");
+    // FIXME: This is a hack to support building targets that don't
+    // support jemalloc alongside hosts that do. The jemalloc build is
+    // controlled by a feature of the std crate, and if that feature
+    // changes between targets, it invalidates the fingerprint of
+    // std's build script (this is a cargo bug); so we must ensure
+    // that the feature set used by std is the same across all
+    // targets, which means we have to build the alloc_jemalloc crate
+    // for targets like emscripten, even if we don't use it.
+    let target = env::var("TARGET").expect("TARGET was not set");
+    let host = env::var("HOST").expect("HOST was not set");
+    if target.contains("rumprun") || target.contains("bitrig") || target.contains("openbsd") ||
+       target.contains("msvc") || target.contains("emscripten") || target.contains("fuchsia") ||
+       target.contains("redox") {
+        println!("cargo:rustc-cfg=dummy_jemalloc");
+        return;
+    }
 
-    let target = env::var("TARGET").unwrap();
-    let host = env::var("HOST").unwrap();
-    let build_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let src_dir = env::current_dir().unwrap();
+    if target.contains("android") {
+        println!("cargo:rustc-link-lib=gcc");
+    } else if !target.contains("windows") && !target.contains("musl") {
+        println!("cargo:rustc-link-lib=pthread");
+    }
 
     if let Some(jemalloc) = env::var_os("JEMALLOC_OVERRIDE") {
         let jemalloc = PathBuf::from(jemalloc);
@@ -30,23 +48,48 @@ fn main() {
                  jemalloc.parent().unwrap().display());
         let stem = jemalloc.file_stem().unwrap().to_str().unwrap();
         let name = jemalloc.file_name().unwrap().to_str().unwrap();
-        let kind = if name.ends_with(".a") {"static"} else {"dylib"};
+        let kind = if name.ends_with(".a") {
+            "static"
+        } else {
+            "dylib"
+        };
         println!("cargo:rustc-link-lib={}={}", kind, &stem[3..]);
-        return
+        return;
     }
 
+    let link_name = if target.contains("windows") { "jemalloc" } else { "jemalloc_pic" };
+    let native = match native_lib_boilerplate("jemalloc", "jemalloc", link_name, "lib") {
+        Ok(native) => native,
+        _ => return,
+    };
+
     let compiler = gcc::Config::new().get_compiler();
-    let ar = build_helper::cc2ar(compiler.path(), &target);
-    let cflags = compiler.args().iter().map(|s| s.to_str().unwrap())
-                         .collect::<Vec<_>>().join(" ");
+    // only msvc returns None for ar so unwrap is okay
+    let ar = build_helper::cc2ar(compiler.path(), &target).unwrap();
+    let cflags = compiler.args()
+        .iter()
+        .map(|s| s.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let mut cmd = Command::new("sh");
-    cmd.arg(src_dir.join("../jemalloc/configure").to_str().unwrap()
-                   .replace("C:\\", "/c/")
-                   .replace("\\", "/"))
-       .current_dir(&build_dir)
+    cmd.arg(native.src_dir.join("configure")
+                          .to_str()
+                          .unwrap()
+                          .replace("C:\\", "/c/")
+                          .replace("\\", "/"))
+       .current_dir(&native.out_dir)
        .env("CC", compiler.path())
-       .env("EXTRA_CFLAGS", cflags)
+       .env("EXTRA_CFLAGS", cflags.clone())
+       // jemalloc generates Makefile deps using GCC's "-MM" flag. This means
+       // that GCC will run the preprocessor, and only the preprocessor, over
+       // jemalloc's source files. If we don't specify CPPFLAGS, then at least
+       // on ARM that step fails with a "Missing implementation for 32-bit
+       // atomic operations" error. This is because no "-march" flag will be
+       // passed to GCC, and then GCC won't define the
+       // "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4" macro that jemalloc needs to
+       // select an atomic operation implementation.
+       .env("CPPFLAGS", cflags.clone())
        .env("AR", &ar)
        .env("RANLIB", format!("{} s", ar.display()));
 
@@ -86,6 +129,8 @@ fn main() {
         // should be good to go!
         cmd.arg("--with-jemalloc-prefix=je_");
         cmd.arg("--disable-tls");
+    } else if target.contains("dragonfly") {
+        cmd.arg("--with-jemalloc-prefix=je_");
     }
 
     if cfg!(feature = "debug-jemalloc") {
@@ -97,21 +142,34 @@ fn main() {
     cmd.arg(format!("--host={}", build_helper::gnu_target(&target)));
     cmd.arg(format!("--build={}", build_helper::gnu_target(&host)));
 
-    run(&mut cmd);
-    run(Command::new("make")
-                .current_dir(&build_dir)
-                .arg("build_lib_static")
-                .arg("-j").arg(env::var("NUM_JOBS").unwrap()));
-
-    if target.contains("windows") {
-        println!("cargo:rustc-link-lib=static=jemalloc");
-    } else {
-        println!("cargo:rustc-link-lib=static=jemalloc_pic");
+    // for some reason, jemalloc configure doesn't detect this value
+    // automatically for this target
+    if target == "sparc64-unknown-linux-gnu" {
+        cmd.arg("--with-lg-quantum=4");
     }
-    println!("cargo:rustc-link-search=native={}/lib", build_dir.display());
-    if target.contains("android") {
-        println!("cargo:rustc-link-lib=gcc");
-    } else if !target.contains("windows") && !target.contains("musl") {
-        println!("cargo:rustc-link-lib=pthread");
+
+    run(&mut cmd);
+
+    let mut make = Command::new(build_helper::make(&host));
+    make.current_dir(&native.out_dir)
+        .arg("build_lib_static");
+
+    // mingw make seems... buggy? unclear...
+    if !host.contains("windows") {
+        make.arg("-j")
+            .arg(env::var("NUM_JOBS").expect("NUM_JOBS was not set"));
+    }
+
+    run(&mut make);
+
+    // The pthread_atfork symbols is used by jemalloc on android but the really
+    // old android we're building on doesn't have them defined, so just make
+    // sure the symbols are available.
+    if target.contains("androideabi") {
+        println!("cargo:rerun-if-changed=pthread_atfork_dummy.c");
+        gcc::Config::new()
+            .flag("-fvisibility=hidden")
+            .file("pthread_atfork_dummy.c")
+            .compile("libpthread_atfork_dummy.a");
     }
 }

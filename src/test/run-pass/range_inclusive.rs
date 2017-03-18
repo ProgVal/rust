@@ -75,7 +75,7 @@ pub fn main() {
 
     // test the size hints and emptying
     let mut long = 0...255u8;
-    let mut short = 42...42;
+    let mut short = 42...42u8;
     assert_eq!(long.size_hint(), (256, Some(256)));
     assert_eq!(short.size_hint(), (1, Some(1)));
     long.next();
@@ -116,11 +116,6 @@ pub fn main() {
     let mut nonsense = 10...5;
     assert_eq!(nonsense.next(), None);
     assert_eq!(nonsense, RangeInclusive::Empty { at: 10 });
-
-    // conversion
-    assert_eq!(0...9, (0..10).into());
-    assert_eq!(0...0, (0..1).into());
-    assert_eq!(RangeInclusive::Empty { at: 1 }, (1..0).into());
 
     // output
     assert_eq!(format!("{:?}", 0...10), "0...10");

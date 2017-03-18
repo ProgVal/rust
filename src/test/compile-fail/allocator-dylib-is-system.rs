@@ -18,6 +18,8 @@
 // system allocator. Do this by linking in jemalloc and making sure that we get
 // an error.
 
+// ignore-emscripten FIXME: What "other allocator" should we use for emcc?
+
 #![feature(alloc_jemalloc)]
 
 extern crate allocator_dylib;
@@ -28,7 +30,7 @@ extern crate allocator_dylib;
 // that this just passes on those platforms we link in some other allocator to
 // ensure we get the same error.
 //
-// So long as we CI linux/OSX we should be good.
+// So long as we CI linux/macOS we should be good.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern crate alloc_jemalloc;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

@@ -18,19 +18,21 @@ struct Foo {
 }
 
 pub fn main() {
-    let x = vec!(
+    let x = vec![
         Foo { string: "foo".to_string() },
         Foo { string: "bar".to_string() },
         Foo { string: "baz".to_string() }
-    );
+    ];
     let x: &[Foo] = &x;
-    match x {
-        [_, tail..] => {
+    match *x {
+        [_, ref tail..] => {
             match tail {
-                [Foo { string: a }, //~ ERROR cannot move out of borrowed content
-                 Foo { string: b }] => {
-                    //~^^ NOTE attempting to move value to here
-                    //~^^ NOTE and here
+                &[Foo { string: a },
+                //~^ ERROR cannot move out of type `[Foo]`
+                //~| cannot move out
+                //~| to prevent move
+                  Foo { string: b }] => {
+                    //~^ NOTE and here
                 }
                 _ => {
                     unreachable!();

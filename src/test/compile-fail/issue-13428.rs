@@ -10,8 +10,7 @@
 
 // Regression test for #13428
 
-fn foo() -> String {  //~ ERROR not all control paths return a value
-    //~^ HELP run `rustc --explain E0269` to see a detailed explanation
+fn foo() -> String {  //~ ERROR mismatched types
     format!("Hello {}",
             "world")
     // Put the trailing semicolon on its own line to test that the
@@ -19,8 +18,7 @@ fn foo() -> String {  //~ ERROR not all control paths return a value
     ;   //~ HELP consider removing this semicolon
 }
 
-fn bar() -> String {  //~ ERROR not all control paths return a value
-    //~^ HELP run `rustc --explain E0269` to see a detailed explanation
+fn bar() -> String {  //~ ERROR mismatched types
     "foobar".to_string()
     ;   //~ HELP consider removing this semicolon
 }

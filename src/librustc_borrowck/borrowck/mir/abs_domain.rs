@@ -21,13 +21,11 @@
 //! `a[x]` would still overlap them both. But that is not this
 //! representation does today.)
 
-use rustc::mir::repr::{Lvalue, LvalueElem};
-use rustc::mir::repr::{Operand, Projection, ProjectionElem};
+use rustc::mir::LvalueElem;
+use rustc::mir::{Operand, ProjectionElem};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct AbstractOperand;
-pub type AbstractProjection<'tcx> =
-    Projection<'tcx, Lvalue<'tcx>, AbstractOperand>;
 pub type AbstractElem<'tcx> =
     ProjectionElem<'tcx, AbstractOperand>;
 
@@ -49,6 +47,8 @@ impl<'tcx> Lift for LvalueElem<'tcx> {
                 ProjectionElem::Field(f.clone(), ty.clone()),
             ProjectionElem::Index(ref i) =>
                 ProjectionElem::Index(i.lift()),
+            ProjectionElem::Subslice {from, to} =>
+                ProjectionElem::Subslice { from: from, to: to },
             ProjectionElem::ConstantIndex {offset,min_length,from_end} =>
                 ProjectionElem::ConstantIndex {
                     offset: offset,

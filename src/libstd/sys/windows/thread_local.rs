@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use prelude::v1::*;
-
 use ptr;
 use sys::c;
 use sys_common::mutex::Mutex;
@@ -209,7 +207,7 @@ unsafe fn unregister_dtor(key: Key) -> bool {
 // loop to basically match Unix semantics. If we don't reach a fixed point
 // after a short while then we just inevitably leak something most likely.
 //
-// # The article mentions crazy stuff about "/INCLUDE"?
+// # The article mentions weird stuff about "/INCLUDE"?
 //
 // It sure does! Specifically we're talking about this quote:
 //

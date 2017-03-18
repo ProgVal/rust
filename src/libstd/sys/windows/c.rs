@@ -47,7 +47,9 @@ pub type CHAR = c_char;
 pub type HCRYPTPROV = LONG_PTR;
 pub type ULONG_PTR = c_ulonglong;
 pub type ULONG = c_ulong;
+#[cfg(target_arch = "x86_64")]
 pub type ULONGLONG = u64;
+#[cfg(target_arch = "x86_64")]
 pub type DWORDLONG = ULONGLONG;
 
 pub type LPBOOL = *mut BOOL;
@@ -66,8 +68,8 @@ pub type LPVOID = *mut c_void;
 pub type LPWCH = *mut WCHAR;
 pub type LPWIN32_FIND_DATAW = *mut WIN32_FIND_DATAW;
 pub type LPWSADATA = *mut WSADATA;
-pub type LPWSAPROTOCOLCHAIN = *mut WSAPROTOCOLCHAIN;
 pub type LPWSAPROTOCOL_INFO = *mut WSAPROTOCOL_INFO;
+pub type LPSTR = *mut CHAR;
 pub type LPWSTR = *mut WCHAR;
 pub type LPFILETIME = *mut FILETIME;
 
@@ -165,6 +167,7 @@ pub const SYMLINK_FLAG_RELATIVE: DWORD = 0x00000001;
 pub const FSCTL_SET_REPARSE_POINT: DWORD = 0x900a4;
 
 pub const SYMBOLIC_LINK_FLAG_DIRECTORY: DWORD = 0x1;
+pub const SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE: DWORD = 0x2;
 
 // Note that these are not actually HANDLEs, just values to pass to GetStdHandle
 pub const STD_INPUT_HANDLE: DWORD = -10i32 as DWORD;
@@ -181,6 +184,8 @@ pub const ERROR_ACCESS_DENIED: DWORD = 5;
 pub const ERROR_INVALID_HANDLE: DWORD = 6;
 pub const ERROR_NO_MORE_FILES: DWORD = 18;
 pub const ERROR_HANDLE_EOF: DWORD = 38;
+pub const ERROR_FILE_EXISTS: DWORD = 80;
+pub const ERROR_INVALID_PARAMETER: DWORD = 87;
 pub const ERROR_BROKEN_PIPE: DWORD = 109;
 pub const ERROR_CALL_NOT_IMPLEMENTED: DWORD = 120;
 pub const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
@@ -241,6 +246,7 @@ pub const IP_ADD_MEMBERSHIP: c_int = 12;
 pub const IP_DROP_MEMBERSHIP: c_int = 13;
 pub const IPV6_ADD_MEMBERSHIP: c_int = 12;
 pub const IPV6_DROP_MEMBERSHIP: c_int = 13;
+pub const MSG_PEEK: c_int = 0x2;
 
 #[repr(C)]
 pub struct ip_mreq {
@@ -262,6 +268,7 @@ pub const FILE_CURRENT: DWORD = 1;
 pub const FILE_END: DWORD = 2;
 
 pub const WAIT_OBJECT_0: DWORD = 0x00000000;
+pub const WAIT_TIMEOUT: DWORD = 258;
 
 #[cfg(target_env = "msvc")]
 pub const MAX_SYM_NAME: usize = 2000;
@@ -277,23 +284,9 @@ pub const CRYPT_VERIFYCONTEXT: DWORD = 0xF0000000;
 pub const EXCEPTION_CONTINUE_SEARCH: LONG = 0;
 pub const EXCEPTION_STACK_OVERFLOW: DWORD = 0xc00000fd;
 pub const EXCEPTION_MAXIMUM_PARAMETERS: usize = 15;
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub const EXCEPTION_NONCONTINUABLE: DWORD = 0x1;   // Noncontinuable exception
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub const EXCEPTION_UNWINDING: DWORD = 0x2;        // Unwind is in progress
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub const EXCEPTION_EXIT_UNWIND: DWORD = 0x4;      // Exit unwind is in progress
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub const EXCEPTION_TARGET_UNWIND: DWORD = 0x20;   // Target unwind in progress
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub const EXCEPTION_COLLIDED_UNWIND: DWORD = 0x40; // Collided exception handler call
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub const EXCEPTION_UNWIND: DWORD = EXCEPTION_UNWINDING |
-                                    EXCEPTION_EXIT_UNWIND |
-                                    EXCEPTION_TARGET_UNWIND |
-                                    EXCEPTION_COLLIDED_UNWIND;
 
 pub const PIPE_ACCESS_INBOUND: DWORD = 0x00000001;
+pub const PIPE_ACCESS_OUTBOUND: DWORD = 0x00000002;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE: DWORD = 0x00080000;
 pub const FILE_FLAG_OVERLAPPED: DWORD = 0x40000000;
 pub const PIPE_WAIT: DWORD = 0x00000000;
@@ -323,8 +316,6 @@ pub struct WSADATA {
     pub szDescription: [u8; WSADESCRIPTION_LEN + 1],
     pub szSystemStatus: [u8; WSASYS_STATUS_LEN + 1],
 }
-
-pub type WSAEVENT = HANDLE;
 
 #[repr(C)]
 pub struct WSAPROTOCOL_INFO {
@@ -400,6 +391,15 @@ pub enum FILE_INFO_BY_HANDLE_CLASS {
     FileIdExtdDirectoryInfo         = 19, // 0x13
     FileIdExtdDirectoryRestartInfo  = 20, // 0x14
     MaximumFileInfoByHandlesClass
+}
+
+#[repr(C)]
+pub struct FILE_BASIC_INFO {
+    pub CreationTime: LARGE_INTEGER,
+    pub LastAccessTime: LARGE_INTEGER,
+    pub LastWriteTime: LARGE_INTEGER,
+    pub ChangeTime: LARGE_INTEGER,
+    pub FileAttributes: DWORD,
 }
 
 #[repr(C)]
@@ -813,31 +813,6 @@ pub struct in6_addr {
     pub s6_addr: [u8; 16],
 }
 
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub enum UNWIND_HISTORY_TABLE {}
-
-#[repr(C)]
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub struct RUNTIME_FUNCTION {
-    pub BeginAddress: DWORD,
-    pub EndAddress: DWORD,
-    pub UnwindData: DWORD,
-}
-
-#[repr(C)]
-#[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-pub struct DISPATCHER_CONTEXT {
-    pub ControlPc: LPVOID,
-    pub ImageBase: LPVOID,
-    pub FunctionEntry: *const RUNTIME_FUNCTION,
-    pub EstablisherFrame: LPVOID,
-    pub TargetIp: LPVOID,
-    pub ContextRecord: *const CONTEXT,
-    pub LanguageHandler: LPVOID,
-    pub HandlerData: *const u8,
-    pub HistoryTable: *const UNWIND_HISTORY_TABLE,
-}
-
 #[repr(C)]
 #[derive(Copy, Clone)]
 #[allow(dead_code)] // we only use some variants
@@ -848,12 +823,15 @@ pub enum EXCEPTION_DISPOSITION {
     ExceptionCollidedUnwind
 }
 
-#[link(name = "ws2_32")]
-#[link(name = "userenv")]
-#[link(name = "shell32")]
-#[link(name = "advapi32")]
-#[cfg(not(cargobuild))]
-extern {}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CONSOLE_READCONSOLE_CONTROL {
+    pub nLength: ULONG,
+    pub nInitialChars: ULONG,
+    pub dwCtrlWakeupMask: ULONG,
+    pub dwControlKeyState: ULONG,
+}
+pub type PCONSOLE_READCONSOLE_CONTROL = *mut CONSOLE_READCONSOLE_CONTROL;
 
 extern "system" {
     pub fn WSAStartup(wVersionRequested: WORD,
@@ -878,12 +856,11 @@ extern "system" {
     pub fn LeaveCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
     pub fn DeleteCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
 
-    // FIXME - pInputControl should be PCONSOLE_READCONSOLE_CONTROL
     pub fn ReadConsoleW(hConsoleInput: HANDLE,
                         lpBuffer: LPVOID,
                         nNumberOfCharsToRead: DWORD,
                         lpNumberOfCharsRead: LPDWORD,
-                        pInputControl: LPVOID) -> BOOL;
+                        pInputControl: PCONSOLE_READCONSOLE_CONTROL) -> BOOL;
 
     pub fn WriteConsoleW(hConsoleOutput: HANDLE,
                          lpBuffer: LPCVOID,
@@ -935,7 +912,7 @@ extern "system" {
     pub fn Sleep(dwMilliseconds: DWORD);
     pub fn GetProcessId(handle: HANDLE) -> DWORD;
     pub fn GetUserProfileDirectoryW(hToken: HANDLE,
-                                    lpProfileDir: LPCWSTR,
+                                    lpProfileDir: LPWSTR,
                                     lpcchSize: *mut DWORD) -> BOOL;
     pub fn SetHandleInformation(hObject: HANDLE,
                                 dwMask: DWORD,
@@ -992,6 +969,14 @@ extern "system" {
     pub fn DeleteFileW(lpPathName: LPCWSTR) -> BOOL;
     pub fn GetCurrentDirectoryW(nBufferLength: DWORD, lpBuffer: LPWSTR) -> DWORD;
     pub fn SetCurrentDirectoryW(lpPathName: LPCWSTR) -> BOOL;
+    pub fn WideCharToMultiByte(CodePage: UINT,
+                               dwFlags: DWORD,
+                               lpWideCharStr: LPCWSTR,
+                               cchWideChar: c_int,
+                               lpMultiByteStr: LPSTR,
+                               cbMultiByte: c_int,
+                               lpDefaultChar: LPCSTR,
+                               lpUsedDefaultChar: LPBOOL) -> c_int;
 
     pub fn closesocket(socket: SOCKET) -> c_int;
     pub fn recv(socket: SOCKET, buf: *mut c_void, len: c_int,
@@ -1113,19 +1098,6 @@ extern "system" {
                           pbBuffer: *mut BYTE) -> BOOL;
     pub fn CryptReleaseContext(hProv: HCRYPTPROV, dwFlags: DWORD) -> BOOL;
 
-    #[unwind]
-    #[cfg(any(target_arch = "x86_64", target_env = "msvc"))]
-    pub fn RaiseException(dwExceptionCode: DWORD,
-                          dwExceptionFlags: DWORD,
-                          nNumberOfArguments: DWORD,
-                          lpArguments: *const ULONG_PTR);
-    #[cfg(all(target_arch = "x86_64", target_env = "gnu"))]
-    pub fn RtlUnwindEx(TargetFrame: LPVOID,
-                       TargetIp: LPVOID,
-                       ExceptionRecord: *const EXCEPTION_RECORD,
-                       ReturnValue: LPVOID,
-                       OriginalContext: *const CONTEXT,
-                       HistoryTable: *const UNWIND_HISTORY_TABLE);
     pub fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: LPFILETIME);
 
     pub fn CreateEventW(lpEventAttributes: LPSECURITY_ATTRIBUTES,
@@ -1210,3 +1182,34 @@ compat_fn! {
         panic!("rwlocks not available")
     }
 }
+
+#[cfg(target_env = "gnu")]
+mod gnu {
+    use super::*;
+
+    pub const PROCESS_QUERY_INFORMATION: DWORD = 0x0400;
+
+    pub const CP_ACP: UINT = 0;
+
+    pub const WC_NO_BEST_FIT_CHARS: DWORD = 0x00000400;
+
+    extern "system" {
+        pub fn OpenProcess(dwDesiredAccess: DWORD,
+                           bInheritHandle: BOOL,
+                           dwProcessId: DWORD) -> HANDLE;
+    }
+
+    compat_fn! {
+        kernel32:
+
+        pub fn QueryFullProcessImageNameW(_hProcess: HANDLE,
+                                          _dwFlags: DWORD,
+                                          _lpExeName: LPWSTR,
+                                          _lpdwSize: LPDWORD) -> BOOL {
+            SetLastError(ERROR_CALL_NOT_IMPLEMENTED as DWORD); 0
+        }
+    }
+}
+
+#[cfg(target_env = "gnu")]
+pub use self::gnu::*;

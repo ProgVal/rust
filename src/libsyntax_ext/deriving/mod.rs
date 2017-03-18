@@ -10,15 +10,14 @@
 
 //! The compiler code necessary to implement the `#[derive]` extensions.
 
-use syntax::ast::{MetaItem, MetaItemKind, self};
-use syntax::attr::AttrMetaMethods;
-use syntax::ext::base::{ExtCtxt, SyntaxEnv, Annotatable};
-use syntax::ext::base::{MultiDecorator, MultiItemDecorator, MultiModifier};
+use std::rc::Rc;
+use syntax::ast;
+use syntax::codemap;
+use syntax::ext::base::{Annotatable, ExtCtxt, SyntaxExtension, Resolver};
 use syntax::ext::build::AstBuilder;
-use syntax::feature_gate;
-use syntax::codemap::Span;
-use syntax::parse::token::{intern, intern_and_get_ident};
 use syntax::ptr::P;
+use syntax::symbol::Symbol;
+use syntax_pos::Span;
 
 macro_rules! pathvec {
     ($($x:ident)::+) => (
@@ -28,7 +27,7 @@ macro_rules! pathvec {
 
 macro_rules! path {
     ($($x:tt)*) => (
-        ::ext::deriving::generic::ty::Path::new( pathvec!( $($x)* ) )
+        ::ext::deriving::generic::ty::Path::new( pathvec![ $($x)* ] )
     )
 }
 
@@ -40,7 +39,7 @@ macro_rules! path_local {
 
 macro_rules! pathvec_std {
     ($cx:expr, $first:ident :: $($rest:ident)::+) => ({
-        let mut v = pathvec!($($rest)::+);
+        let mut v = pathvec![$($rest)::+];
         if let Some(s) = $cx.crate_root {
             v.insert(0, s);
         }
@@ -61,6 +60,7 @@ pub mod decodable;
 pub mod hash;
 pub mod debug;
 pub mod default;
+pub mod custom;
 
 #[path="cmp/partial_eq.rs"]
 pub mod partial_eq;
@@ -74,138 +74,36 @@ pub mod ord;
 
 pub mod generic;
 
-fn expand_derive(cx: &mut ExtCtxt,
-                 span: Span,
-                 mitem: &MetaItem,
-                 annotatable: Annotatable)
-                 -> Annotatable {
-    debug!("expand_derive: span = {:?}", span);
-    debug!("expand_derive: mitem = {:?}", mitem);
-    debug!("expand_derive: annotatable input  = {:?}", annotatable);
-    let annot = annotatable.map_item_or(|item| {
-        item.map(|mut item| {
-            if mitem.value_str().is_some() {
-                cx.span_err(mitem.span, "unexpected value in `derive`");
-            }
-
-            let traits = mitem.meta_item_list().unwrap_or(&[]);
-            if traits.is_empty() {
-                cx.span_warn(mitem.span, "empty trait list in `derive`");
-            }
-
-            let mut found_partial_eq = false;
-            let mut found_eq = false;
-
-            for titem in traits.iter().rev() {
-                let tname = match titem.node {
-                    MetaItemKind::Word(ref tname) => tname,
-                    _ => {
-                        cx.span_err(titem.span, "malformed `derive` entry");
-                        continue;
-                    }
-                };
-
-                if !(is_builtin_trait(tname) || cx.ecfg.enable_custom_derive()) {
-                    feature_gate::emit_feature_err(&cx.parse_sess.span_diagnostic,
-                                                   "custom_derive",
-                                                   titem.span,
-                                                   feature_gate::GateIssue::Language,
-                                                   feature_gate::EXPLAIN_CUSTOM_DERIVE);
-                    continue;
-                }
-
-                if &tname[..] == "Eq" {
-                    found_eq = true;
-                } else if &tname[..] == "PartialEq" {
-                    found_partial_eq = true;
-                }
-
-                // #[derive(Foo, Bar)] expands to #[derive_Foo] #[derive_Bar]
-                item.attrs.push(cx.attribute(titem.span, cx.meta_word(titem.span,
-                    intern_and_get_ident(&format!("derive_{}", tname)))));
-            }
-
-            // RFC #1445. `#[derive(PartialEq, Eq)]` adds a (trusted)
-            // `#[structural_match]` attribute.
-            if found_partial_eq && found_eq {
-                // This span is **very** sensitive and crucial to
-                // getting the stability behavior we want. What we are
-                // doing is marking `#[structural_match]` with the
-                // span of the `#[deriving(...)]` attribute (the
-                // entire attribute, not just the `PartialEq` or `Eq`
-                // part), but with the current backtrace. The current
-                // backtrace will contain a topmost entry that IS this
-                // `#[deriving(...)]` attribute and with the
-                // "allow-unstable" flag set to true.
-                //
-                // Note that we do NOT use the span of the `Eq`
-                // text itself. You might think this is
-                // equivalent, because the `Eq` appears within the
-                // `#[deriving(Eq)]` attribute, and hence we would
-                // inherit the "allows unstable" from the
-                // backtrace.  But in fact this is not always the
-                // case. The actual source text that led to
-                // deriving can be `#[$attr]`, for example, where
-                // `$attr == deriving(Eq)`. In that case, the
-                // "#[structural_match]" would be considered to
-                // originate not from the deriving call but from
-                // text outside the deriving call, and hence would
-                // be forbidden from using unstable
-                // content.
-                //
-                // See tests src/run-pass/rfc1445 for
-                // examples. --nmatsakis
-                let span = Span { expn_id: cx.backtrace(), .. span };
-                assert!(cx.parse_sess.codemap().span_allows_unstable(span));
-                debug!("inserting structural_match with span {:?}", span);
-                let structural_match = intern_and_get_ident("structural_match");
-                item.attrs.push(cx.attribute(span,
-                                             cx.meta_word(span,
-                                                          structural_match)));
-            }
-
-            item
-        })
-    }, |a| {
-        cx.span_err(span, "`derive` can only be applied to items");
-        a
-    });
-    debug!("expand_derive: annotatable output = {:?}", annot);
-    annot
+fn allow_unstable(cx: &mut ExtCtxt, span: Span, attr_name: &str) -> Span {
+    Span {
+        expn_id: cx.codemap().record_expansion(codemap::ExpnInfo {
+            call_site: span,
+            callee: codemap::NameAndSpan {
+                format: codemap::MacroAttribute(Symbol::intern(attr_name)),
+                span: Some(span),
+                allow_internal_unstable: true,
+            },
+        }),
+        ..span
+    }
 }
 
 macro_rules! derive_traits {
     ($( $name:expr => $func:path, )+) => {
-        pub fn register_all(env: &mut SyntaxEnv) {
-            // Define the #[derive_*] extensions.
-            $({
-                struct DeriveExtension;
-
-                impl MultiItemDecorator for DeriveExtension {
-                    fn expand(&self,
-                              ecx: &mut ExtCtxt,
-                              sp: Span,
-                              mitem: &MetaItem,
-                              annotatable: &Annotatable,
-                              push: &mut FnMut(Annotatable)) {
-                        warn_if_deprecated(ecx, sp, $name);
-                        $func(ecx, sp, mitem, annotatable, push);
-                    }
-                }
-
-                env.insert(intern(concat!("derive_", $name)),
-                           MultiDecorator(Box::new(DeriveExtension)));
-            })+
-
-            env.insert(intern("derive"),
-                       MultiModifier(Box::new(expand_derive)));
-        }
-
-        fn is_builtin_trait(name: &str) -> bool {
-            match name {
+        pub fn is_builtin_trait(name: ast::Name) -> bool {
+            match &*name.as_str() {
                 $( $name )|+ => true,
                 _ => false,
             }
+        }
+
+        pub fn register_builtin_derives(resolver: &mut Resolver) {
+            $(
+                resolver.add_builtin(
+                    ast::Ident::with_empty_ctxt(Symbol::intern($name)),
+                    Rc::new(SyntaxExtension::BuiltinDerive($func))
+                );
+            )*
         }
     }
 }
@@ -244,8 +142,10 @@ fn warn_if_deprecated(ecx: &mut ExtCtxt, sp: Span, name: &str) {
         "Decodable" => Some("RustcDecodable"),
         _ => None,
     } {
-        ecx.span_warn(sp, &format!("derive({}) is deprecated in favor of derive({})",
-                                   name, replacement));
+        ecx.span_warn(sp,
+                      &format!("derive({}) is deprecated in favor of derive({})",
+                               name,
+                               replacement));
     }
 }
 
@@ -258,8 +158,7 @@ fn hygienic_type_parameter(item: &Annotatable, base: &str) -> String {
     if let Annotatable::Item(ref item) = *item {
         match item.node {
             ast::ItemKind::Struct(_, ast::Generics { ref ty_params, .. }) |
-                ast::ItemKind::Enum(_, ast::Generics { ref ty_params, .. }) => {
-
+            ast::ItemKind::Enum(_, ast::Generics { ref ty_params, .. }) => {
                 for ty in ty_params.iter() {
                     typaram.push_str(&ty.ident.name.as_str());
                 }
@@ -274,17 +173,26 @@ fn hygienic_type_parameter(item: &Annotatable, base: &str) -> String {
 
 /// Constructs an expression that calls an intrinsic
 fn call_intrinsic(cx: &ExtCtxt,
-                  span: Span,
+                  mut span: Span,
                   intrinsic: &str,
-                  args: Vec<P<ast::Expr>>) -> P<ast::Expr> {
+                  args: Vec<P<ast::Expr>>)
+                  -> P<ast::Expr> {
+    span.expn_id = cx.codemap().record_expansion(codemap::ExpnInfo {
+        call_site: span,
+        callee: codemap::NameAndSpan {
+            format: codemap::MacroAttribute(Symbol::intern("derive")),
+            span: Some(span),
+            allow_internal_unstable: true,
+        },
+    });
+
     let path = cx.std_path(&["intrinsics", intrinsic]);
     let call = cx.expr_call_global(span, path, args);
 
     cx.expr_block(P(ast::Block {
-        stmts: vec![],
-        expr: Some(call),
+        stmts: vec![cx.stmt_expr(call)],
         id: ast::DUMMY_NODE_ID,
         rules: ast::BlockCheckMode::Unsafe(ast::CompilerGenerated),
-        span: span }))
+        span: span,
+    }))
 }
-

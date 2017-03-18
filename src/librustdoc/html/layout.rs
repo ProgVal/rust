@@ -9,7 +9,6 @@
 // except according to those terms.
 
 use std::fmt;
-use std::io::prelude::*;
 use std::io;
 
 use externalfiles::ExternalHtml;
@@ -20,19 +19,19 @@ pub struct Layout {
     pub favicon: String,
     pub external_html: ExternalHtml,
     pub krate: String,
-    pub playground_url: String,
 }
 
 pub struct Page<'a> {
     pub title: &'a str,
-    pub ty: &'a str,
+    pub css_class: &'a str,
     pub root_path: &'a str,
     pub description: &'a str,
-    pub keywords: &'a str
+    pub keywords: &'a str,
 }
 
 pub fn render<T: fmt::Display, S: fmt::Display>(
-    dst: &mut io::Write, layout: &Layout, page: &Page, sidebar: &S, t: &T)
+    dst: &mut io::Write, layout: &Layout, page: &Page, sidebar: &S, t: &T,
+    css_file_extension: bool)
     -> io::Result<()>
 {
     write!(dst,
@@ -47,8 +46,10 @@ r##"<!DOCTYPE html>
 
     <title>{title}</title>
 
+    <link rel="stylesheet" type="text/css" href="{root_path}normalize.css">
     <link rel="stylesheet" type="text/css" href="{root_path}rustdoc.css">
     <link rel="stylesheet" type="text/css" href="{root_path}main.css">
+    {css_extension}
 
     {favicon}
     {in_header}
@@ -79,7 +80,7 @@ r##"<!DOCTYPE html>
         </form>
     </nav>
 
-    <section id='main' class="content {ty}">{content}</section>
+    <section id='main' class="content {css_class}">{content}</section>
     <section id='search' class="content hidden"></section>
 
     <section class="footer"></section>
@@ -102,6 +103,8 @@ r##"<!DOCTYPE html>
                     <dd>Move down in search results</dd>
                     <dt>&#9166;</dt>
                     <dd>Go to active search result</dd>
+                    <dt>+</dt>
+                    <dd>Collapse/expand all sections</dd>
                 </dl>
             </div>
 
@@ -133,17 +136,21 @@ r##"<!DOCTYPE html>
     <script>
         window.rootPath = "{root_path}";
         window.currentCrate = "{krate}";
-        window.playgroundUrl = "{play_url}";
     </script>
     <script src="{root_path}jquery.js"></script>
     <script src="{root_path}main.js"></script>
-    {play_js}
     <script defer src="{root_path}search-index.js"></script>
 </body>
 </html>"##,
+    css_extension = if css_file_extension {
+        format!("<link rel=\"stylesheet\" type=\"text/css\" href=\"{root_path}theme.css\">",
+                root_path = page.root_path)
+    } else {
+        "".to_owned()
+    },
     content   = *t,
     root_path = page.root_path,
-    ty        = page.ty,
+    css_class = page.css_class,
     logo      = if layout.logo.is_empty() {
         "".to_string()
     } else {
@@ -165,12 +172,6 @@ r##"<!DOCTYPE html>
     after_content = layout.external_html.after_content,
     sidebar   = *sidebar,
     krate     = layout.krate,
-    play_url  = layout.playground_url,
-    play_js   = if layout.playground_url.is_empty() {
-        "".to_string()
-    } else {
-        format!(r#"<script src="{}playpen.js"></script>"#, page.root_path)
-    },
     )
 }
 

@@ -64,7 +64,7 @@ mod imp {
     unsafe fn siginfo_si_addr(info: *mut libc::siginfo_t) -> usize {
         #[repr(C)]
         struct siginfo_t {
-            a: [libc::c_int; 3], // si_signo, si_code, si_errno,
+            a: [libc::c_int; 3], // si_signo, si_errno, si_code
             si_addr: *mut libc::c_void,
         }
 
@@ -187,7 +187,7 @@ mod imp {
             let stack =  libc::stack_t {
                 ss_sp: ptr::null_mut(),
                 ss_flags: SS_DISABLE,
-                // Workaround for bug in MacOS implementation of sigaltstack
+                // Workaround for bug in macOS implementation of sigaltstack
                 // UNIX2003 which returns ENOMEM when disabling a stack while
                 // passing ss_size smaller than MINSIGSTKSZ. According to POSIX
                 // both ss_sp and ss_size should be ignored in this case.

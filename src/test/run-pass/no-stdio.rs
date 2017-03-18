@@ -8,6 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// ignore-emscripten
+// ignore-android
+
 #![feature(libc)]
 
 extern crate libc;

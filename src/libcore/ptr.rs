@@ -16,17 +16,14 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use clone::Clone;
 use intrinsics;
 use ops::{CoerceUnsized, Deref};
 use fmt;
 use hash;
-use option::Option::{self, Some, None};
-use marker::{Copy, PhantomData, Send, Sized, Sync, Unsize};
+use marker::{PhantomData, Unsize};
 use mem;
 use nonzero::NonZero;
 
-use cmp::{PartialEq, Eq, Ord, PartialOrd};
 use cmp::Ordering::{self, Less, Equal, Greater};
 
 // FIXME #19649: intrinsic docs don't render, so these have no docs :(
@@ -77,7 +74,10 @@ pub const fn null_mut<T>() -> *mut T { 0 as *mut T }
 ///
 /// # Safety
 ///
-/// This is only unsafe because it accepts a raw pointer.
+/// This function copies the memory through the raw pointers passed to it
+/// as arguments.
+///
+/// Ensure that these pointers are valid before calling `swap`.
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub unsafe fn swap<T>(x: *mut T, y: *mut T) {
@@ -119,6 +119,21 @@ pub unsafe fn replace<T>(dest: *mut T, mut src: T) -> T {
 /// `src` is not used before the data is overwritten again (e.g. with `write`,
 /// `zero_memory`, or `copy_memory`). Note that `*src = foo` counts as a use
 /// because it will attempt to drop the value previously at `*src`.
+///
+/// The pointer must be aligned; use `read_unaligned` if that is not the case.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// let x = 12;
+/// let y = &x as *const i32;
+///
+/// unsafe {
+///     assert_eq!(std::ptr::read(y), 12);
+/// }
+/// ```
 #[inline(always)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub unsafe fn read<T>(src: *const T) -> T {
@@ -127,18 +142,41 @@ pub unsafe fn read<T>(src: *const T) -> T {
     tmp
 }
 
-#[allow(missing_docs)]
+/// Reads the value from `src` without moving it. This leaves the
+/// memory in `src` unchanged.
+///
+/// Unlike `read`, the pointer may be unaligned.
+///
+/// # Safety
+///
+/// Beyond accepting a raw pointer, this is unsafe because it semantically
+/// moves the value out of `src` without preventing further usage of `src`.
+/// If `T` is not `Copy`, then care must be taken to ensure that the value at
+/// `src` is not used before the data is overwritten again (e.g. with `write`,
+/// `zero_memory`, or `copy_memory`). Note that `*src = foo` counts as a use
+/// because it will attempt to drop the value previously at `*src`.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// #![feature(ptr_unaligned)]
+///
+/// let x = 12;
+/// let y = &x as *const i32;
+///
+/// unsafe {
+///     assert_eq!(std::ptr::read_unaligned(y), 12);
+/// }
+/// ```
 #[inline(always)]
-#[unstable(feature = "filling_drop",
-           reason = "may play a larger role in std::ptr future extensions",
-           issue = "5016")]
-pub unsafe fn read_and_drop<T>(dest: *mut T) -> T {
-    // Copy the data out from `dest`:
-    let tmp = read(&*dest);
-
-    // Now mark `dest` as dropped:
-    write_bytes(dest, mem::POST_DROP_U8, 1);
-
+#[unstable(feature = "ptr_unaligned", issue = "37955")]
+pub unsafe fn read_unaligned<T>(src: *const T) -> T {
+    let mut tmp: T = mem::uninitialized();
+    copy_nonoverlapping(src as *const u8,
+                        &mut tmp as *mut T as *mut u8,
+                        mem::size_of::<T>());
     tmp
 }
 
@@ -153,12 +191,76 @@ pub unsafe fn read_and_drop<T>(dest: *mut T) -> T {
 /// allocations or resources, so care must be taken not to overwrite an object
 /// that should be dropped.
 ///
+/// Additionally, it does not drop `src`. Semantically, `src` is moved into the
+/// location pointed to by `dst`.
+///
 /// This is appropriate for initializing uninitialized memory, or overwriting
 /// memory that has previously been `read` from.
+///
+/// The pointer must be aligned; use `write_unaligned` if that is not the case.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// let mut x = 0;
+/// let y = &mut x as *mut i32;
+/// let z = 12;
+///
+/// unsafe {
+///     std::ptr::write(y, z);
+///     assert_eq!(std::ptr::read(y), 12);
+/// }
+/// ```
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub unsafe fn write<T>(dst: *mut T, src: T) {
     intrinsics::move_val_init(&mut *dst, src)
+}
+
+/// Overwrites a memory location with the given value without reading or
+/// dropping the old value.
+///
+/// Unlike `write`, the pointer may be unaligned.
+///
+/// # Safety
+///
+/// This operation is marked unsafe because it accepts a raw pointer.
+///
+/// It does not drop the contents of `dst`. This is safe, but it could leak
+/// allocations or resources, so care must be taken not to overwrite an object
+/// that should be dropped.
+///
+/// Additionally, it does not drop `src`. Semantically, `src` is moved into the
+/// location pointed to by `dst`.
+///
+/// This is appropriate for initializing uninitialized memory, or overwriting
+/// memory that has previously been `read` from.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// #![feature(ptr_unaligned)]
+///
+/// let mut x = 0;
+/// let y = &mut x as *mut i32;
+/// let z = 12;
+///
+/// unsafe {
+///     std::ptr::write_unaligned(y, z);
+///     assert_eq!(std::ptr::read_unaligned(y), 12);
+/// }
+/// ```
+#[inline]
+#[unstable(feature = "ptr_unaligned", issue = "37955")]
+pub unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
+    copy_nonoverlapping(&src as *const T as *const u8,
+                        dst as *mut u8,
+                        mem::size_of::<T>());
+    mem::forget(src);
 }
 
 /// Performs a volatile read of the value from `src` without moving it. This
@@ -166,9 +268,16 @@ pub unsafe fn write<T>(dst: *mut T, src: T) {
 ///
 /// Volatile operations are intended to act on I/O memory, and are guaranteed
 /// to not be elided or reordered by the compiler across other volatile
-/// operations. See the LLVM documentation on [[volatile]].
+/// operations.
 ///
-/// [volatile]: http://llvm.org/docs/LangRef.html#volatile-memory-accesses
+/// # Notes
+///
+/// Rust does not currently have a rigorously and formally defined memory model,
+/// so the precise semantics of what "volatile" means here is subject to change
+/// over time. That being said, the semantics will almost always end up pretty
+/// similar to [C11's definition of volatile][c11].
+///
+/// [c11]: http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
 ///
 /// # Safety
 ///
@@ -178,8 +287,21 @@ pub unsafe fn write<T>(dst: *mut T, src: T) {
 /// `src` is not used before the data is overwritten again (e.g. with `write`,
 /// `zero_memory`, or `copy_memory`). Note that `*src = foo` counts as a use
 /// because it will attempt to drop the value previously at `*src`.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// let x = 12;
+/// let y = &x as *const i32;
+///
+/// unsafe {
+///     assert_eq!(std::ptr::read_volatile(y), 12);
+/// }
+/// ```
 #[inline]
-#[unstable(feature = "volatile", reason = "recently added", issue = "31756")]
+#[stable(feature = "volatile", since = "1.9.0")]
 pub unsafe fn read_volatile<T>(src: *const T) -> T {
     intrinsics::volatile_load(src)
 }
@@ -189,9 +311,16 @@ pub unsafe fn read_volatile<T>(src: *const T) -> T {
 ///
 /// Volatile operations are intended to act on I/O memory, and are guaranteed
 /// to not be elided or reordered by the compiler across other volatile
-/// operations. See the LLVM documentation on [[volatile]].
+/// operations.
 ///
-/// [volatile]: http://llvm.org/docs/LangRef.html#volatile-memory-accesses
+/// # Notes
+///
+/// Rust does not currently have a rigorously and formally defined memory model,
+/// so the precise semantics of what "volatile" means here is subject to change
+/// over time. That being said, the semantics will almost always end up pretty
+/// similar to [C11's definition of volatile][c11].
+///
+/// [c11]: http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf
 ///
 /// # Safety
 ///
@@ -203,8 +332,23 @@ pub unsafe fn read_volatile<T>(src: *const T) -> T {
 ///
 /// This is appropriate for initializing uninitialized memory, or overwriting
 /// memory that has previously been `read` from.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// let mut x = 0;
+/// let y = &mut x as *mut i32;
+/// let z = 12;
+///
+/// unsafe {
+///     std::ptr::write_volatile(y, z);
+///     assert_eq!(std::ptr::read_volatile(y), 12);
+/// }
+/// ```
 #[inline]
-#[unstable(feature = "volatile", reason = "recently added", issue = "31756")]
+#[stable(feature = "volatile", since = "1.9.0")]
 pub unsafe fn write_volatile<T>(dst: *mut T, src: T) {
     intrinsics::volatile_store(dst, src);
 }
@@ -220,7 +364,7 @@ impl<T: ?Sized> *const T {
     /// ```
     /// let s: &str = "Follow the rabbit";
     /// let ptr: *const u8 = s.as_ptr();
-    /// assert!(ptr.is_null() == false);
+    /// assert!(!ptr.is_null());
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
@@ -238,6 +382,9 @@ impl<T: ?Sized> *const T {
     /// operation because the returned value could be pointing to invalid
     /// memory.
     ///
+    /// Additionally, the lifetime `'a` returned is arbitrarily chosen and does
+    /// not necessarily reflect the actual lifetime of the data.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -251,17 +398,13 @@ impl<T: ?Sized> *const T {
     ///     }
     /// }
     /// ```
-    #[unstable(feature = "ptr_as_ref",
-               reason = "Option is not clearly the right return type, and we \
-                         may want to tie the return lifetime to a borrow of \
-                         the raw pointer",
-               issue = "27780")]
+    #[stable(feature = "ptr_as_ref", since = "1.9.0")]
     #[inline]
-    pub unsafe fn as_ref<'a>(&self) -> Option<&'a T> where T: Sized {
+    pub unsafe fn as_ref<'a>(self) -> Option<&'a T> where T: Sized {
         if self.is_null() {
             None
         } else {
-            Some(&**self)
+            Some(&*self)
         }
     }
 
@@ -293,6 +436,45 @@ impl<T: ?Sized> *const T {
     pub unsafe fn offset(self, count: isize) -> *const T where T: Sized {
         intrinsics::offset(self, count)
     }
+
+    /// Calculates the offset from a pointer using wrapping arithmetic.
+    /// `count` is in units of T; e.g. a `count` of 3 represents a pointer
+    /// offset of `3 * sizeof::<T>()` bytes.
+    ///
+    /// # Safety
+    ///
+    /// The resulting pointer does not need to be in bounds, but it is
+    /// potentially hazardous to dereference (which requires `unsafe`).
+    ///
+    /// Always use `.offset(count)` instead when possible, because `offset`
+    /// allows the compiler to optimize better.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// // Iterate using a raw pointer in increments of two elements
+    /// let data = [1u8, 2, 3, 4, 5];
+    /// let mut ptr: *const u8 = data.as_ptr();
+    /// let step = 2;
+    /// let end_rounded_up = ptr.wrapping_offset(6);
+    ///
+    /// // This loop prints "1, 3, 5, "
+    /// while ptr != end_rounded_up {
+    ///     unsafe {
+    ///         print!("{}, ", *ptr);
+    ///     }
+    ///     ptr = ptr.wrapping_offset(step);
+    /// }
+    /// ```
+    #[stable(feature = "ptr_wrapping_offset", since = "1.16.0")]
+    #[inline]
+    pub fn wrapping_offset(self, count: isize) -> *const T where T: Sized {
+        unsafe {
+            intrinsics::arith_offset(self, count)
+        }
+    }
 }
 
 #[lang = "mut_ptr"]
@@ -306,7 +488,7 @@ impl<T: ?Sized> *mut T {
     /// ```
     /// let mut s = [1, 2, 3];
     /// let ptr: *mut u32 = s.as_mut_ptr();
-    /// assert!(ptr.is_null() == false);
+    /// assert!(!ptr.is_null());
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
@@ -324,6 +506,9 @@ impl<T: ?Sized> *mut T {
     /// operation because the returned value could be pointing to invalid
     /// memory.
     ///
+    /// Additionally, the lifetime `'a` returned is arbitrarily chosen and does
+    /// not necessarily reflect the actual lifetime of the data.
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -337,17 +522,13 @@ impl<T: ?Sized> *mut T {
     ///     }
     /// }
     /// ```
-    #[unstable(feature = "ptr_as_ref",
-               reason = "Option is not clearly the right return type, and we \
-                         may want to tie the return lifetime to a borrow of \
-                         the raw pointer",
-               issue = "27780")]
+    #[stable(feature = "ptr_as_ref", since = "1.9.0")]
     #[inline]
-    pub unsafe fn as_ref<'a>(&self) -> Option<&'a T> where T: Sized {
+    pub unsafe fn as_ref<'a>(self) -> Option<&'a T> where T: Sized {
         if self.is_null() {
             None
         } else {
-            Some(&**self)
+            Some(&*self)
         }
     }
 
@@ -379,13 +560,53 @@ impl<T: ?Sized> *mut T {
         intrinsics::offset(self, count) as *mut T
     }
 
+    /// Calculates the offset from a pointer using wrapping arithmetic.
+    /// `count` is in units of T; e.g. a `count` of 3 represents a pointer
+    /// offset of `3 * sizeof::<T>()` bytes.
+    ///
+    /// # Safety
+    ///
+    /// The resulting pointer does not need to be in bounds, but it is
+    /// potentially hazardous to dereference (which requires `unsafe`).
+    ///
+    /// Always use `.offset(count)` instead when possible, because `offset`
+    /// allows the compiler to optimize better.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// // Iterate using a raw pointer in increments of two elements
+    /// let mut data = [1u8, 2, 3, 4, 5];
+    /// let mut ptr: *mut u8 = data.as_mut_ptr();
+    /// let step = 2;
+    /// let end_rounded_up = ptr.wrapping_offset(6);
+    ///
+    /// while ptr != end_rounded_up {
+    ///     unsafe {
+    ///         *ptr = 0;
+    ///     }
+    ///     ptr = ptr.wrapping_offset(step);
+    /// }
+    /// assert_eq!(&data, &[0, 2, 0, 4, 0]);
+    /// ```
+    #[stable(feature = "ptr_wrapping_offset", since = "1.16.0")]
+    #[inline]
+    pub fn wrapping_offset(self, count: isize) -> *mut T where T: Sized {
+        unsafe {
+            intrinsics::arith_offset(self, count) as *mut T
+        }
+    }
+
     /// Returns `None` if the pointer is null, or else returns a mutable
     /// reference to the value wrapped in `Some`.
     ///
     /// # Safety
     ///
     /// As with `as_ref`, this is unsafe because it cannot verify the validity
-    /// of the returned pointer.
+    /// of the returned pointer, nor can it ensure that the lifetime `'a`
+    /// returned is indeed a valid lifetime for the contained data.
     ///
     /// # Examples
     ///
@@ -394,17 +615,17 @@ impl<T: ?Sized> *mut T {
     /// ```
     /// let mut s = [1, 2, 3];
     /// let ptr: *mut u32 = s.as_mut_ptr();
+    /// let first_value = unsafe { ptr.as_mut().unwrap() };
+    /// *first_value = 4;
+    /// println!("{:?}", s); // It'll print: "[4, 2, 3]".
     /// ```
-    #[unstable(feature = "ptr_as_ref",
-               reason = "return value does not necessarily convey all possible \
-                         information",
-               issue = "27780")]
+    #[stable(feature = "ptr_as_ref", since = "1.9.0")]
     #[inline]
-    pub unsafe fn as_mut<'a>(&self) -> Option<&'a mut T> where T: Sized {
+    pub unsafe fn as_mut<'a>(self) -> Option<&'a mut T> where T: Sized {
         if self.is_null() {
             None
         } else {
-            Some(&mut **self)
+            Some(&mut *self)
         }
     }
 }
@@ -427,6 +648,40 @@ impl<T: ?Sized> PartialEq for *mut T {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> Eq for *mut T {}
+
+/// Compare raw pointers for equality.
+///
+/// This is the same as using the `==` operator, but less generic:
+/// the arguments have to be `*const T` raw pointers,
+/// not anything that implements `PartialEq`.
+///
+/// This can be used to compare `&T` references (which coerce to `*const T` implicitly)
+/// by their address rather than comparing the values they point to
+/// (which is what the `PartialEq for &T` implementation does).
+///
+/// # Examples
+///
+/// ```
+/// #![feature(ptr_eq)]
+/// use std::ptr;
+///
+/// let five = 5;
+/// let other_five = 5;
+/// let five_ref = &five;
+/// let same_five_ref = &five;
+/// let other_five_ref = &other_five;
+///
+/// assert!(five_ref == same_five_ref);
+/// assert!(five_ref == other_five_ref);
+///
+/// assert!(ptr::eq(five_ref, same_five_ref));
+/// assert!(!ptr::eq(five_ref, other_five_ref));
+/// ```
+#[unstable(feature = "ptr_eq", reason = "newly added", issue = "36497")]
+#[inline]
+pub fn eq<T: ?Sized>(a: *const T, b: *const T) -> bool {
+    a == b
+}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized> Clone for *const T {
@@ -506,12 +761,21 @@ macro_rules! fnptr_impls_safety_abi {
 }
 
 macro_rules! fnptr_impls_args {
-    ($($Arg: ident),*) => {
+    ($($Arg: ident),+) => {
         fnptr_impls_safety_abi! { extern "Rust" fn($($Arg),*) -> Ret, $($Arg),* }
         fnptr_impls_safety_abi! { extern "C" fn($($Arg),*) -> Ret, $($Arg),* }
+        fnptr_impls_safety_abi! { extern "C" fn($($Arg),* , ...) -> Ret, $($Arg),* }
         fnptr_impls_safety_abi! { unsafe extern "Rust" fn($($Arg),*) -> Ret, $($Arg),* }
         fnptr_impls_safety_abi! { unsafe extern "C" fn($($Arg),*) -> Ret, $($Arg),* }
-    }
+        fnptr_impls_safety_abi! { unsafe extern "C" fn($($Arg),* , ...) -> Ret, $($Arg),* }
+    };
+    () => {
+        // No variadic functions with 0 parameters
+        fnptr_impls_safety_abi! { extern "Rust" fn() -> Ret, }
+        fnptr_impls_safety_abi! { extern "C" fn() -> Ret, }
+        fnptr_impls_safety_abi! { unsafe extern "Rust" fn() -> Ret, }
+        fnptr_impls_safety_abi! { unsafe extern "C" fn() -> Ret, }
+    };
 }
 
 fnptr_impls_args! { }
@@ -667,7 +931,7 @@ impl<T:?Sized> Deref for Unique<T> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[unstable(feature = "unique", issue = "27730")]
 impl<T> fmt::Pointer for Unique<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Pointer::fmt(&*self.pointer, f)

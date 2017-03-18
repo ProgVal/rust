@@ -8,10 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![feature(rustc_attrs)]
-
-// ignore-pretty : (#23623) problems when  ending with // comments
-
 // check raw fat pointer ops in mir
 // FIXME: please improve this when we get monomorphization support
 
@@ -54,7 +50,6 @@ const GT: ComparisonResults = ComparisonResults {
     ne: true
 };
 
-#[rustc_mir]
 fn compare_su8(a: *const S<[u8]>, b: *const S<[u8]>) -> ComparisonResults {
     ComparisonResults {
         lt: a < b,
@@ -66,7 +61,6 @@ fn compare_su8(a: *const S<[u8]>, b: *const S<[u8]>) -> ComparisonResults {
     }
 }
 
-#[rustc_mir]
 fn compare_au8(a: *const [u8], b: *const [u8]) -> ComparisonResults {
     ComparisonResults {
         lt: a < b,
@@ -78,7 +72,6 @@ fn compare_au8(a: *const [u8], b: *const [u8]) -> ComparisonResults {
     }
 }
 
-#[rustc_mir]
 fn compare_foo<'a>(a: *const (Foo+'a), b: *const (Foo+'a)) -> ComparisonResults {
     ComparisonResults {
         lt: a < b,
@@ -90,7 +83,6 @@ fn compare_foo<'a>(a: *const (Foo+'a), b: *const (Foo+'a)) -> ComparisonResults 
     }
 }
 
-#[rustc_mir]
 fn simple_eq<'a>(a: *const (Foo+'a), b: *const (Foo+'a)) -> bool {
     let result = a == b;
     result
@@ -121,7 +113,6 @@ impl<T> Foo for T {
 
 struct S<T:?Sized>(u32, T);
 
-#[rustc_no_mir] // FIXME #27840 MIR can't do rvalue promotion yet.
 fn main() {
     let array = [0,1,2,3,4];
     let array2 = [5,6,7,8,9];

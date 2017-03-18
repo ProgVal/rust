@@ -9,44 +9,41 @@
 // except according to those terms.
 
 use dep_graph::DepNode;
-use middle::def_id::DefId;
+use hir::def_id::{DefId, LOCAL_CRATE};
 use traits::{self, specialization_graph};
 use ty;
 use ty::fast_reject;
 use ty::{Ty, TyCtxt, TraitRef};
-use std::borrow::{Borrow};
-use std::cell::{Cell, Ref, RefCell};
-use syntax::ast::Name;
-use rustc_front::hir;
-use util::nodemap::FnvHashMap;
+use std::cell::{Cell, RefCell};
+use hir;
+use util::nodemap::FxHashMap;
 
-/// As `TypeScheme` but for a trait ref.
-pub struct TraitDef<'tcx> {
+use syntax::ast;
+use syntax_pos::DUMMY_SP;
+
+/// A trait's definition with type information.
+pub struct TraitDef {
+    pub def_id: DefId,
+
     pub unsafety: hir::Unsafety,
 
     /// If `true`, then this trait had the `#[rustc_paren_sugar]`
     /// attribute, indicating that it should be used with `Foo()`
-    /// sugar. This is a temporary thing -- eventually any trait wil
+    /// sugar. This is a temporary thing -- eventually any trait will
     /// be usable with the sugar (or without it).
     pub paren_sugar: bool,
 
-    /// Generic type definitions. Note that `Self` is listed in here
-    /// as having a single bound, the trait itself (e.g., in the trait
-    /// `Eq`, there is a single bound `Self : Eq`). This is so that
-    /// default methods get to assume that the `Self` parameters
-    /// implements the trait.
-    pub generics: ty::Generics<'tcx>,
-
-    pub trait_ref: ty::TraitRef<'tcx>,
-
-    /// A list of the associated types defined in this trait. Useful
-    /// for resolving `X::Foo` type markers.
-    pub associated_type_names: Vec<Name>,
-
-    // Impls of this trait. To allow for quicker lookup, the impls are indexed
-    // by a simplified version of their Self type: impls with a simplifiable
-    // Self are stored in nonblanket_impls keyed by it, while all other impls
-    // are stored in blanket_impls.
+    // Impls of a trait. To allow for quicker lookup, the impls are indexed by a
+    // simplified version of their `Self` type: impls with a simplifiable `Self`
+    // are stored in `nonblanket_impls` keyed by it, while all other impls are
+    // stored in `blanket_impls`.
+    //
+    // A similar division is used within `specialization_graph`, but the ones
+    // here are (1) stored as a flat list for the trait and (2) populated prior
+    // to -- and used while -- determining specialization order.
+    //
+    // FIXME: solve the reentrancy issues and remove these lists in favor of the
+    // ones in `specialization_graph`.
     //
     // These lists are tracked by `DepNode::TraitImpls`; we don't use
     // a DepTrackingMap but instead have the `TraitDef` insert the
@@ -54,7 +51,7 @@ pub struct TraitDef<'tcx> {
 
     /// Impls of the trait.
     nonblanket_impls: RefCell<
-        FnvHashMap<fast_reject::SimplifiedType, Vec<DefId>>
+        FxHashMap<fast_reject::SimplifiedType, Vec<DefId>>
     >,
 
     /// Blanket impls associated with the trait.
@@ -64,31 +61,35 @@ pub struct TraitDef<'tcx> {
     pub specialization_graph: RefCell<traits::specialization_graph::Graph>,
 
     /// Various flags
-    pub flags: Cell<TraitFlags>
+    pub flags: Cell<TraitFlags>,
+
+    /// The number of impls we've added from the local crate.
+    /// When this number matches up the list in the HIR map,
+    /// we're done, and the specialization graph is correct.
+    local_impl_count: Cell<usize>,
+
+    /// The ICH of this trait's DefPath, cached here so it doesn't have to be
+    /// recomputed all the time.
+    pub def_path_hash: u64,
 }
 
-impl<'tcx> TraitDef<'tcx> {
-    pub fn new(unsafety: hir::Unsafety,
+impl<'a, 'gcx, 'tcx> TraitDef {
+    pub fn new(def_id: DefId,
+               unsafety: hir::Unsafety,
                paren_sugar: bool,
-               generics: ty::Generics<'tcx>,
-               trait_ref: ty::TraitRef<'tcx>,
-               associated_type_names: Vec<Name>)
-               -> TraitDef<'tcx> {
+               def_path_hash: u64)
+               -> TraitDef {
         TraitDef {
+            def_id: def_id,
             paren_sugar: paren_sugar,
             unsafety: unsafety,
-            generics: generics,
-            trait_ref: trait_ref,
-            associated_type_names: associated_type_names,
-            nonblanket_impls: RefCell::new(FnvHashMap()),
+            nonblanket_impls: RefCell::new(FxHashMap()),
             blanket_impls: RefCell::new(vec![]),
             flags: Cell::new(ty::TraitFlags::NO_TRAIT_FLAGS),
+            local_impl_count: Cell::new(0),
             specialization_graph: RefCell::new(traits::specialization_graph::Graph::new()),
+            def_path_hash: def_path_hash,
         }
-    }
-
-    pub fn def_id(&self) -> DefId {
-        self.trait_ref.def_id
     }
 
     // returns None if not yet calculated
@@ -111,19 +112,18 @@ impl<'tcx> TraitDef<'tcx> {
         );
     }
 
-    fn write_trait_impls(&self, tcx: &TyCtxt<'tcx>) {
-        tcx.dep_graph.write(DepNode::TraitImpls(self.trait_ref.def_id));
+    fn write_trait_impls(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>) {
+        tcx.dep_graph.write(DepNode::TraitImpls(self.def_id));
     }
 
-    fn read_trait_impls(&self, tcx: &TyCtxt<'tcx>) {
-        tcx.dep_graph.read(DepNode::TraitImpls(self.trait_ref.def_id));
+    fn read_trait_impls(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>) {
+        tcx.dep_graph.read(DepNode::TraitImpls(self.def_id));
     }
 
     /// Records a basic trait-to-implementation mapping.
     ///
     /// Returns `true` iff the impl has not previously been recorded.
-    fn record_impl(&self,
-                   tcx: &TyCtxt<'tcx>,
+    fn record_impl(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>,
                    impl_def_id: DefId,
                    impl_trait_ref: TraitRef<'tcx>)
                    -> bool {
@@ -158,22 +158,27 @@ impl<'tcx> TraitDef<'tcx> {
     }
 
     /// Records a trait-to-implementation mapping for a crate-local impl.
-    pub fn record_local_impl(&self,
-                             tcx: &TyCtxt<'tcx>,
+    pub fn record_local_impl(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>,
                              impl_def_id: DefId,
                              impl_trait_ref: TraitRef<'tcx>) {
         assert!(impl_def_id.is_local());
         let was_new = self.record_impl(tcx, impl_def_id, impl_trait_ref);
         assert!(was_new);
+
+        self.local_impl_count.set(self.local_impl_count.get() + 1);
+    }
+
+    /// Records a trait-to-implementation mapping.
+    pub fn record_has_default_impl(&self) {
+        self.flags.set(self.flags.get() | TraitFlags::HAS_DEFAULT_IMPL);
     }
 
     /// Records a trait-to-implementation mapping for a non-local impl.
     ///
     /// The `parent_impl` is the immediately-less-specialized impl, or the
-    /// trait's def ID if the impl is is not a specialization -- information that
+    /// trait's def ID if the impl is not a specialization -- information that
     /// should be pulled from the metadata.
-    pub fn record_remote_impl(&self,
-                              tcx: &TyCtxt<'tcx>,
+    pub fn record_remote_impl(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>,
                               impl_def_id: DefId,
                               impl_trait_ref: TraitRef<'tcx>,
                               parent_impl: DefId) {
@@ -184,30 +189,71 @@ impl<'tcx> TraitDef<'tcx> {
             // if the impl is non-local, it's placed directly into the
             // specialization graph using parent information drawn from metadata.
             self.specialization_graph.borrow_mut()
-                .record_impl_from_cstore(parent_impl, impl_def_id)
+                .record_impl_from_cstore(tcx, parent_impl, impl_def_id)
         }
     }
 
     /// Adds a local impl into the specialization graph, returning an error with
     /// overlap information if the impl overlaps but does not specialize an
     /// existing impl.
-    pub fn add_impl_for_specialization<'a>(&self,
-                                           tcx: &'a TyCtxt<'tcx>,
-                                           impl_def_id: DefId)
-                                           -> Result<(), traits::Overlap<'a, 'tcx>> {
+    pub fn add_impl_for_specialization(&self,
+                                       tcx: TyCtxt<'a, 'gcx, 'tcx>,
+                                       impl_def_id: DefId)
+                                       -> Result<(), traits::OverlapError> {
         assert!(impl_def_id.is_local());
 
         self.specialization_graph.borrow_mut()
             .insert(tcx, impl_def_id)
     }
 
-    pub fn ancestors<'a>(&'a self, of_impl: DefId) -> specialization_graph::Ancestors<'a, 'tcx> {
+    pub fn ancestors(&'a self, of_impl: DefId) -> specialization_graph::Ancestors<'a> {
         specialization_graph::ancestors(self, of_impl)
     }
 
-        pub fn for_each_impl<F: FnMut(DefId)>(&self, tcx: &TyCtxt<'tcx>, mut f: F)  {
-            self.read_trait_impls(tcx);
-        tcx.populate_implementations_for_trait_if_necessary(self.trait_ref.def_id);
+    /// Whether the impl set and specialization graphs are complete.
+    pub fn is_complete(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> bool {
+        tcx.populate_implementations_for_trait_if_necessary(self.def_id);
+        ty::queries::coherent_trait::try_get(tcx, DUMMY_SP, (LOCAL_CRATE, self.def_id)).is_ok()
+    }
+
+    /// If any local impls haven't been added yet, returns
+    /// Some(list of local impls for this trait).
+    fn missing_local_impls(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>)
+                           -> Option<&'gcx [ast::NodeId]> {
+        if self.flags.get().intersects(TraitFlags::HAS_LOCAL_IMPLS) {
+            return None;
+        }
+
+        if self.is_complete(tcx) {
+            self.flags.set(self.flags.get() | TraitFlags::HAS_LOCAL_IMPLS);
+            return None;
+        }
+
+        let impls = tcx.hir.trait_impls(self.def_id);
+        assert!(self.local_impl_count.get() <= impls.len());
+        if self.local_impl_count.get() == impls.len() {
+            self.flags.set(self.flags.get() | TraitFlags::HAS_LOCAL_IMPLS);
+            return None;
+        }
+
+        Some(impls)
+    }
+
+    pub fn for_each_impl<F: FnMut(DefId)>(&self, tcx: TyCtxt<'a, 'gcx, 'tcx>, mut f: F) {
+        self.read_trait_impls(tcx);
+        tcx.populate_implementations_for_trait_if_necessary(self.def_id);
+
+        let local_impls = self.missing_local_impls(tcx);
+        if let Some(impls) = local_impls {
+            for &id in impls {
+                f(tcx.hir.local_def_id(id));
+            }
+        }
+        let mut f = |def_id: DefId| {
+            if !(local_impls.is_some() && def_id.is_local()) {
+                f(def_id);
+            }
+        };
 
         for &impl_def_id in self.blanket_impls.borrow().iter() {
             f(impl_def_id);
@@ -223,13 +269,24 @@ impl<'tcx> TraitDef<'tcx> {
     /// Iterate over every impl that could possibly match the
     /// self-type `self_ty`.
     pub fn for_each_relevant_impl<F: FnMut(DefId)>(&self,
-                                                   tcx: &TyCtxt<'tcx>,
+                                                   tcx: TyCtxt<'a, 'gcx, 'tcx>,
                                                    self_ty: Ty<'tcx>,
                                                    mut f: F)
     {
         self.read_trait_impls(tcx);
+        tcx.populate_implementations_for_trait_if_necessary(self.def_id);
 
-        tcx.populate_implementations_for_trait_if_necessary(self.trait_ref.def_id);
+        let local_impls = self.missing_local_impls(tcx);
+        if let Some(impls) = local_impls {
+            for &id in impls {
+                f(tcx.hir.local_def_id(id));
+            }
+        }
+        let mut f = |def_id: DefId| {
+            if !(local_impls.is_some() && def_id.is_local()) {
+                f(def_id);
+            }
+        };
 
         for &impl_def_id in self.blanket_impls.borrow().iter() {
             f(impl_def_id);
@@ -261,14 +318,6 @@ impl<'tcx> TraitDef<'tcx> {
             }
         }
     }
-
-    pub fn borrow_impl_lists<'s>(&'s self, tcx: &TyCtxt<'tcx>)
-                                 -> (Ref<'s, Vec<DefId>>,
-                                     Ref<'s, FnvHashMap<fast_reject::SimplifiedType, Vec<DefId>>>) {
-        self.read_trait_impls(tcx);
-        (self.blanket_impls.borrow(), self.nonblanket_impls.borrow())
-    }
-
 }
 
 bitflags! {
@@ -277,6 +326,7 @@ bitflags! {
         const HAS_DEFAULT_IMPL      = 1 << 0,
         const IS_OBJECT_SAFE        = 1 << 1,
         const OBJECT_SAFETY_VALID   = 1 << 2,
-        const IMPLS_VALID           = 1 << 3,
+        const HAS_REMOTE_IMPLS      = 1 << 3,
+        const HAS_LOCAL_IMPLS       = 1 << 4,
     }
 }

@@ -13,8 +13,6 @@
 //! This module is "publicly exported" through the `FromStr` implementations
 //! below.
 
-use prelude::v1::*;
-
 use error::Error;
 use fmt;
 use net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -304,7 +302,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-#[stable(feature = "rust1", since = "1.0.0")]
+#[stable(feature = "ip_addr", since = "1.7.0")]
 impl FromStr for IpAddr {
     type Err = AddrParseError;
     fn from_str(s: &str) -> Result<IpAddr, AddrParseError> {
@@ -372,7 +370,7 @@ impl FromStr for SocketAddr {
 
 /// An error returned when parsing an IP address or a socket address.
 #[stable(feature = "rust1", since = "1.0.0")]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddrParseError(());
 
 #[stable(feature = "addr_parse_error_error", since = "1.4.0")]

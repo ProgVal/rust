@@ -71,7 +71,8 @@ which includes important information about what platform you're on, what
 version of Rust you're using, etc.
 
 Sometimes, a backtrace is helpful, and so including that is nice. To get
-a backtrace, set the `RUST_BACKTRACE` environment variable. The easiest way
+a backtrace, set the `RUST_BACKTRACE` environment variable to a value
+other than `0`. The easiest way
 to do this is to invoke `rustc` like this:
 
 ```bash
@@ -85,62 +86,152 @@ benchmarks, generate documentation, install a fresh build of Rust, and more.
 It's your best friend when working on Rust, allowing you to compile & test
 your contributions before submission.
 
-All the configuration for the build system lives in [the `mk` directory][mkdir]
-in the project root. It can be hard to follow in places, as it uses some
-advanced Make features which make for some challenging reading. If you have
-questions on the build system internals, try asking in
-[`#rust-internals`][pound-rust-internals].
+The build system lives in [the `src/bootstrap` directory][bootstrap] in the
+project root. Our build system is itself written in Rust and is based on Cargo
+to actually build all the compiler's crates. If you have questions on the build
+system internals, try asking in [`#rust-internals`][pound-rust-internals].
 
-[mkdir]: https://github.com/rust-lang/rust/tree/master/mk/
+[bootstrap]: https://github.com/rust-lang/rust/tree/master/src/bootstrap/
 
 ### Configuration
 
 Before you can start building the compiler you need to configure the build for
 your system. In most cases, that will just mean using the defaults provided
-for Rust. Configuring involves invoking the `configure` script in the project
-root.
+for Rust.
+
+To change configuration, you must copy the file `src/bootstrap/config.toml.example`
+to `config.toml` in the directory from which you will be running the build, and
+change the settings provided.
+
+There are large number of options provided in this config file that will alter the
+configuration used in the build process. Some options to note:
+
+#### `[llvm]`:
+- `ccache = true` - Use ccache when building llvm
+
+#### `[build]`:
+- `compiler-docs = true` - Build compiler documentation
+
+#### `[rust]`:
+- `debuginfo = true` - Build a compiler with debuginfo
+- `optimize = false` - Disable optimizations to speed up compilation of stage1 rust
+
+For more options, the `config.toml` file contains commented out defaults, with
+descriptions of what each option will do.
+
+Note: Previously the `./configure` script was used to configure this
+project. It can still be used, but it's recommended to use a `config.toml`
+file. If you still have a `config.mk` file in your directory - from
+`./configure` - you may need to delete it for `config.toml` to work.
+
+### Building
+
+The build system uses the `x.py` script to control the build process. This script
+is used to build, test, and document various parts of the compiler. You can
+execute it as:
+
+```sh
+python x.py build
+```
+
+On some systems you can also use the shorter version:
+
+```sh
+./x.py build
+```
+
+To learn more about the driver and top-level targets, you can execute:
+
+```sh
+python x.py --help
+```
+
+The general format for the driver script is:
+
+```sh
+python x.py <command> [<directory>]
+```
+
+Some example commands are `build`, `test`, and `doc`. These will build, test,
+and document the specified directory. The second argument, `<directory>`, is
+optional and defaults to working over the entire compiler. If specified,
+however, only that specific directory will be built. For example:
+
+```sh
+# build the entire compiler
+python x.py build
+
+# build all documentation
+python x.py doc
+
+# run all test suites
+python x.py test
+
+# build only the standard library
+python x.py build src/libstd
+
+# test only one particular test suite
+python x.py test src/test/rustdoc
+
+# build only the stage0 libcore library
+python x.py build src/libcore --stage 0
+```
+
+You can explore the build system throught the various `--help` pages for each
+subcommand. For example to learn more about a command you can run:
 
 ```
-./configure
+python x.py build --help
 ```
 
-There are large number of options accepted by this script to alter the
-configuration used later in the build process. Some options to note:
+To learn about all possible rules you can execute, run:
 
-- `--enable-debug` - Build a debug version of the compiler (disables optimizations)
-- `--enable-optimize` - Enable optimizations (can be used with `--enable-debug`
-    to make a debug build with optimizations)
-- `--disable-valgrind-rpass` - Don't run tests with valgrind
-- `--enable-clang` - Prefer clang to gcc for building dependencies (e.g., LLVM)
-- `--enable-ccache` - Invoke clang/gcc with ccache to re-use object files between builds
-- `--enable-compiler-docs` - Build compiler documentation
+```
+python x.py build --help --verbose
+```
 
-To see a full list of options, run `./configure --help`.
+Note: Previously `./configure` and `make` were used to build this project.
+They are still available, but `x.py` is the recommended build system.
 
-### Useful Targets
+### Useful commands
 
-Some common make targets are:
+Some common invocations of `x.py` are:
 
-- `make rustc-stage1` - build up to (and including) the first stage. For most
-  cases we don't need to build the stage2 compiler, so we can save time by not
-  building it. The stage1 compiler is a fully functioning compiler and
-  (probably) will be enough to determine if your change works as expected.
-- `make check` - build the full compiler & run all tests (takes a while). This
+- `x.py build --help` - show the help message and explain the subcommand
+- `x.py build src/libtest --stage 1` - build up to (and including) the first
+  stage. For most cases we don't need to build the stage2 compiler, so we can
+  save time by not building it. The stage1 compiler is a fully functioning
+  compiler and (probably) will be enough to determine if your change works as
+  expected.
+- `x.py build src/rustc --stage 1` - This will build just rustc, without libstd.
+  This is the fastest way to recompile after you changed only rustc source code.
+  Note however that the resulting rustc binary won't have a stdlib to link
+  against by default. You can build libstd once with `x.py build src/libstd`,
+  but it is only guaranteed to work if recompiled, so if there are any issues
+  recompile it.
+- `x.py test` - build the full compiler & run all tests (takes a while). This
   is what gets run by the continuous integration system against your pull
   request. You should run this before submitting to make sure your tests pass
   & everything builds in the correct manner.
-- `make check-stage1-std NO_REBUILD=1` - test the standard library without
-  rebuilding the entire compiler
-- `make check TESTNAME=<substring-of-test-name>` - Run a matching set of tests.
+- `x.py test src/libstd --stage 1` - test the standard library without
+  recompiling stage 2.
+- `x.py test src/test/run-pass --test-args TESTNAME` - Run a matching set of
+  tests.
   - `TESTNAME` should be a substring of the tests to match against e.g. it could
     be the fully qualified test name, or just a part of it.
     `TESTNAME=collections::hash::map::test_map::test_capacity_not_less_than_len`
     or `TESTNAME=test_capacity_not_less_than_len`.
-- `make check-stage1-rpass TESTNAME=<substring-of-test-name>` - Run a single
-  rpass test with the stage1 compiler (this will be quicker than running the
-  command above as we only build the stage1 compiler, not the entire thing).
-  You can also leave off the `-rpass` to run all stage1 test types.
-- `make check-stage1-coretest` - Run stage1 tests in `libcore`.
+- `x.py test src/test/run-pass --stage 1 --test-args <substring-of-test-name>` -
+  Run a single rpass test with the stage1 compiler (this will be quicker than
+  running the command above as we only build the stage1 compiler, not the entire
+  thing).  You can also leave off the directory argument to run all stage1 test
+  types.
+- `x.py test src/libcore --stage 1` - Run stage1 tests in `libcore`.
+- `x.py test src/tools/tidy` - Check that the source code is in compliance with
+  Rust's style guidelines. There is no official document describing Rust's full
+  guidelines as of yet, but basic rules like 4 spaces for indentation and no
+  more than 99 characters in a single line should be kept in mind when writing
+  code.
 
 ## Pull Requests
 
@@ -152,20 +243,27 @@ feature. We use the 'fork and pull' model described there.
 
 Please make pull requests against the `master` branch.
 
-Compiling all of `make check` can take a while. When testing your pull request,
-consider using one of the more specialized `make` targets to cut down on the
+Compiling all of `./x.py test` can take a while. When testing your pull request,
+consider using one of the more specialized `./x.py` targets to cut down on the
 amount of time you have to wait. You need to have built the compiler at least
 once before running these will work, but that’s only one full build rather than
 one each time.
 
-    $ make -j8 rustc-stage1 && make check-stage1
+    $ python x.py test --stage 1
 
 is one such example, which builds just `rustc`, and then runs the tests. If
 you’re adding something to the standard library, try
 
-    $ make -j8 check-stage1-std NO_REBUILD=1
+    $ python x.py test src/libstd --stage 1
 
-This will not rebuild the compiler, but will run the tests.
+Please make sure your pull request is in compliance with Rust's style
+guidelines by running
+
+    $ python x.py test src/tools/tidy
+
+Make this check before every pull request (and every new commit in a pull
+request) ; you can add [git hooks](https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks)
+before every push to make sure you never forget to make this check.
 
 All pull requests are reviewed by another person. We have a bot,
 @rust-highfive, that will automatically assign a random person to review your
@@ -190,7 +288,7 @@ been approved. The PR then enters the [merge queue][merge-queue], where @bors
 will run all the tests on every platform we support. If it all works out,
 @bors will merge your code into `master` and close the pull request.
 
-[merge-queue]: http://buildbot.rust-lang.org/homu/queue/rust
+[merge-queue]: https://buildbot.rust-lang.org/homu/queue/rust
 
 Speaking of tests, Rust has a comprehensive test suite. More information about
 it can be found
@@ -217,10 +315,10 @@ To find documentation-related issues, sort by the [A-docs label][adocs].
 
 [adocs]: https://github.com/rust-lang/rust/issues?q=is%3Aopen+is%3Aissue+label%3AA-docs
 
-In many cases, you don't need a full `make doc`. You can use `rustdoc` directly
+In many cases, you don't need a full `./x.py doc`. You can use `rustdoc` directly
 to check small fixes. For example, `rustdoc src/doc/reference.md` will render
 reference to `doc/reference.html`. The CSS might be messed up, but you can
-verify that HTML is right.
+verify that the HTML is right.
 
 ## Issue Triage
 
@@ -306,7 +404,7 @@ are:
 [gsearchdocs]: https://www.google.com/search?q=site:doc.rust-lang.org+your+query+here
 [rif]: http://internals.rust-lang.org
 [rr]: https://doc.rust-lang.org/book/README.html
-[tlgba]: http://tomlee.co/2014/04/03/a-more-detailed-tour-of-the-rust-compiler/
+[tlgba]: http://tomlee.co/2014/04/a-more-detailed-tour-of-the-rust-compiler/
 [ro]: http://www.rustaceans.org/
-[rctd]: ./COMPILER_TESTS.md
-[cheatsheet]: http://buildbot.rust-lang.org/homu/
+[rctd]: ./src/test/COMPILER_TESTS.md
+[cheatsheet]: https://buildbot.rust-lang.org/homu/

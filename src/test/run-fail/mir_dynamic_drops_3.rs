@@ -7,7 +7,7 @@
 // <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
-#![feature(rustc_attrs)]
+
 // error-pattern:unwind happens
 // error-pattern:drop 3
 // error-pattern:drop 2
@@ -32,8 +32,7 @@ fn may_panic<'a>() -> Droppable<'a> {
     panic!("unwind happens");
 }
 
-#[rustc_mir]
-fn mir<'a>(d: Droppable<'a>){
+fn mir<'a>(d: Droppable<'a>) {
     let (mut a, mut b) = (false, false);
     let y = Droppable(&mut a, 2);
     let x = [Droppable(&mut b, 1), y, d, may_panic()];

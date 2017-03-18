@@ -22,24 +22,26 @@
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
        test(attr(deny(warnings))))]
-#![cfg_attr(not(stage0), deny(warnings))]
+#![deny(warnings)]
 
 #![feature(associated_consts)]
-#![feature(filling_drop)]
-#![feature(libc)]
+#![feature(const_fn)]
+#![feature(optin_builtin_traits)]
 #![feature(rustc_private)]
 #![feature(staged_api)]
-#![feature(str_char)]
 #![feature(str_escape)]
 #![feature(unicode)]
-#![feature(question_mark)]
+#![feature(rustc_diagnostic_macros)]
+#![feature(specialization)]
+#![feature(i128_type)]
 
 extern crate serialize;
-extern crate term;
-extern crate libc;
 #[macro_use] extern crate log;
 #[macro_use] #[no_link] extern crate rustc_bitflags;
-extern crate rustc_unicode;
+extern crate std_unicode;
+pub extern crate rustc_errors as errors;
+extern crate syntax_pos;
+extern crate rustc_data_structures;
 
 extern crate serialize as rustc_serialize; // used by deriving
 
@@ -52,7 +54,7 @@ extern crate serialize as rustc_serialize; // used by deriving
 macro_rules! panictry {
     ($e:expr) => ({
         use std::result::Result::{Ok, Err};
-        use $crate::errors::FatalError;
+        use errors::FatalError;
         match $e {
             Ok(e) => e,
             Err(mut e) => {
@@ -63,8 +65,19 @@ macro_rules! panictry {
     })
 }
 
+#[macro_use]
+pub mod diagnostics {
+    #[macro_use]
+    pub mod macros;
+    pub mod plugin;
+    pub mod metadata;
+}
+
+// NB: This module needs to be declared first so diagnostics are
+// registered before they are used.
+pub mod diagnostic_list;
+
 pub mod util {
-    pub mod interner;
     pub mod lev_distance;
     pub mod node_count;
     pub mod parser;
@@ -72,16 +85,15 @@ pub mod util {
     pub mod parser_testing;
     pub mod small_vector;
     pub mod move_map;
+
+    mod thin_vec;
+    pub use self::thin_vec::ThinVec;
+
+    mod rc_slice;
+    pub use self::rc_slice::RcSlice;
 }
 
-pub mod diagnostics {
-    pub mod macros;
-    pub mod plugin;
-    pub mod registry;
-    pub mod metadata;
-}
-
-pub mod errors;
+pub mod json;
 
 pub mod syntax {
     pub use ext;
@@ -91,20 +103,21 @@ pub mod syntax {
 
 pub mod abi;
 pub mod ast;
-pub mod ast_util;
 pub mod attr;
 pub mod codemap;
+#[macro_use]
 pub mod config;
 pub mod entry;
 pub mod feature_gate;
 pub mod fold;
-pub mod owned_slice;
 pub mod parse;
 pub mod ptr;
 pub mod show_span;
 pub mod std_inject;
 pub mod str;
+pub mod symbol;
 pub mod test;
+pub mod tokenstream;
 pub mod visit;
 
 pub mod print {
@@ -115,8 +128,10 @@ pub mod print {
 pub mod ext {
     pub mod base;
     pub mod build;
+    pub mod derive;
     pub mod expand;
-    pub mod mtwt;
+    pub mod placeholders;
+    pub mod hygiene;
     pub mod quote;
     pub mod source_util;
 
@@ -124,5 +139,11 @@ pub mod ext {
         pub mod transcribe;
         pub mod macro_parser;
         pub mod macro_rules;
+        pub mod quoted;
     }
 }
+
+#[cfg(test)]
+mod test_snippet;
+
+// __build_diagnostic_array! { libsyntax, DIAGNOSTICS }

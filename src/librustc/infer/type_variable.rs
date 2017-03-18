@@ -11,9 +11,11 @@
 pub use self::RelationDir::*;
 use self::TypeVariableValue::*;
 use self::UndoEntry::*;
-use middle::def_id::{DefId};
+use hir::def_id::{DefId};
+use syntax::util::small_vector::SmallVector;
+use syntax::ast;
+use syntax_pos::Span;
 use ty::{self, Ty};
-use syntax::codemap::Span;
 
 use std::cmp::min;
 use std::marker::PhantomData;
@@ -27,8 +29,24 @@ pub struct TypeVariableTable<'tcx> {
     eq_relations: ut::UnificationTable<ty::TyVid>,
 }
 
+/// Reasons to create a type inference variable
+pub enum TypeVariableOrigin {
+    MiscVariable(Span),
+    NormalizeProjectionType(Span),
+    TypeInference(Span),
+    TypeParameterDefinition(Span, ast::Name),
+    TransformedUpvar(Span),
+    SubstitutionPlaceholder(Span),
+    AutoDeref(Span),
+    AdjustmentType(Span),
+    DivergingStmt(Span),
+    DivergingBlockExpr(Span),
+    LatticeVariable(Span),
+}
+
 struct TypeVariableData<'tcx> {
     value: TypeVariableValue<'tcx>,
+    origin: TypeVariableOrigin,
     diverging: bool
 }
 
@@ -106,6 +124,10 @@ impl<'tcx> TypeVariableTable<'tcx> {
         self.values.get(vid.index as usize).diverging
     }
 
+    pub fn var_origin(&self, vid: ty::TyVid) -> &TypeVariableOrigin {
+        &self.values.get(vid.index as usize).origin
+    }
+
     /// Records that `a <: b`, `a :> b`, or `a == b`, depending on `dir`.
     ///
     /// Precondition: neither `a` nor `b` are known.
@@ -149,7 +171,7 @@ impl<'tcx> TypeVariableTable<'tcx> {
         &mut self,
         vid: ty::TyVid,
         ty: Ty<'tcx>,
-        stack: &mut Vec<(Ty<'tcx>, RelationDir, ty::TyVid)>)
+        stack: &mut SmallVector<(Ty<'tcx>, RelationDir, ty::TyVid)>)
     {
         debug_assert!(self.root_var(vid) == vid);
         let old_value = {
@@ -159,8 +181,8 @@ impl<'tcx> TypeVariableTable<'tcx> {
 
         let (relations, default) = match old_value {
             Bounded { relations, default } => (relations, default),
-            Known(_) => panic!("Asked to instantiate variable that is \
-                               already instantiated")
+            Known(_) => bug!("Asked to instantiate variable that is \
+                              already instantiated")
         };
 
         for &(dir, vid) in &relations {
@@ -172,13 +194,21 @@ impl<'tcx> TypeVariableTable<'tcx> {
 
     pub fn new_var(&mut self,
                    diverging: bool,
-                   default: Option<Default<'tcx>>) -> ty::TyVid {
+                   origin: TypeVariableOrigin,
+                   default: Option<Default<'tcx>>,) -> ty::TyVid {
         self.eq_relations.new_key(());
         let index = self.values.push(TypeVariableData {
             value: Bounded { relations: vec![], default: default },
+            origin: origin,
             diverging: diverging
         });
-        ty::TyVid { index: index as u32 }
+        let v = ty::TyVid { index: index as u32 };
+        debug!("new_var() -> {:?}", v);
+        v
+    }
+
+    pub fn num_vars(&self) -> usize {
+        self.values.len()
     }
 
     pub fn root_var(&mut self, vid: ty::TyVid) -> ty::TyVid {
@@ -219,6 +249,17 @@ impl<'tcx> TypeVariableTable<'tcx> {
     }
 
     pub fn rollback_to(&mut self, s: Snapshot) {
+        debug!("rollback_to{:?}", {
+            for action in self.values.actions_since_snapshot(&s.snapshot) {
+                match *action {
+                    sv::UndoLog::NewElem(index) => {
+                        debug!("inference variable _#{}t popped", index)
+                    }
+                    _ => { }
+                }
+            }
+        });
+
         self.values.rollback_to(s.snapshot);
         self.eq_relations.rollback_to(s.eq_snapshot);
     }
@@ -254,12 +295,12 @@ impl<'tcx> TypeVariableTable<'tcx> {
                     debug!("NewElem({}) new_elem_threshold={}", index, new_elem_threshold);
                 }
 
-                sv::UndoLog::Other(SpecifyVar(vid, _, _)) => {
+                sv::UndoLog::Other(SpecifyVar(vid, ..)) => {
                     if vid.index < new_elem_threshold {
                         // quick check to see if this variable was
                         // created since the snapshot started or not.
                         let escaping_type = match self.values.get(vid.index as usize).value {
-                            Bounded { .. } => unreachable!(),
+                            Bounded { .. } => bug!(),
                             Known(ty) => ty,
                         };
                         escaping_types.push(escaping_type);
@@ -318,7 +359,7 @@ impl<'tcx> sv::SnapshotVecDelegate for Delegate<'tcx> {
 
 fn relations<'a>(v: &'a mut TypeVariableData) -> &'a mut Vec<Relation> {
     match v.value {
-        Known(_) => panic!("var_sub_var: variable is known"),
+        Known(_) => bug!("var_sub_var: variable is known"),
         Bounded { ref mut relations, .. } => relations
     }
 }

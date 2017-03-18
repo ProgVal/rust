@@ -10,39 +10,37 @@
 
 #![deny(warnings)]
 
-#![feature(ascii)]
 #![feature(binary_heap_extras)]
+#![feature(binary_heap_peek_mut_pop)]
 #![feature(box_syntax)]
 #![feature(btree_range)]
+#![feature(inclusive_range_syntax)]
+#![feature(collection_placement)]
 #![feature(collections)]
 #![feature(collections_bound)]
-#![feature(copy_from_slice)]
 #![feature(const_fn)]
-#![feature(fn_traits)]
-#![feature(enumset)]
-#![feature(iter_arith)]
-#![feature(map_entry_keys)]
+#![feature(exact_size_is_empty)]
 #![feature(pattern)]
+#![feature(placement_in_syntax)]
 #![feature(rand)]
-#![feature(set_recovery)]
 #![feature(step_by)]
-#![feature(str_char)]
 #![feature(str_escape)]
 #![feature(test)]
 #![feature(unboxed_closures)]
 #![feature(unicode)]
+#![feature(utf8_error_error_len)]
 
 extern crate collections;
 extern crate test;
-extern crate rustc_unicode;
+extern crate std_unicode;
+extern crate core;
 
-use std::hash::{Hash, Hasher, SipHasher};
-
-#[cfg(test)] #[macro_use] mod bench;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 mod binary_heap;
 mod btree;
-mod enum_set;
+mod cow_str;
 mod fmt;
 mod linked_list;
 mod slice;
@@ -52,7 +50,7 @@ mod vec_deque;
 mod vec;
 
 fn hash<T: Hash>(t: &T) -> u64 {
-    let mut s = SipHasher::new();
+    let mut s = DefaultHasher::new();
     t.hash(&mut s);
     s.finish()
 }

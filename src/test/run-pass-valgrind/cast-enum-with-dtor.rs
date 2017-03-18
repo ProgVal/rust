@@ -8,12 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// ignore-pretty : (#23623) problems when  ending with // comments
-
 // no-prefer-dynamic
 
 #![allow(dead_code)]
-#![feature(const_fn, rustc_attrs)]
+#![feature(const_fn)]
 
 // check dtor calling order when casting enums.
 
@@ -38,7 +36,6 @@ impl Drop for E {
     }
 }
 
-#[rustc_no_mir] // FIXME #27840 MIR miscompiles this.
 fn main() {
     assert_eq!(FLAG.load(Ordering::SeqCst), 0);
     {
@@ -46,5 +43,5 @@ fn main() {
         assert_eq!(e as u32, 2);
         assert_eq!(FLAG.load(Ordering::SeqCst), 0);
     }
-    assert_eq!(FLAG.load(Ordering::SeqCst), 1);
+    assert_eq!(FLAG.load(Ordering::SeqCst), 0);
 }

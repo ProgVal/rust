@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use prelude::v1::*;
-
 use ascii::*;
 use collections::HashMap;
 use collections;
@@ -24,7 +22,7 @@ use mem;
 use os::windows::ffi::OsStrExt;
 use path::Path;
 use ptr;
-use sync::StaticMutex;
+use sys::mutex::Mutex;
 use sys::c;
 use sys::fs::{OpenOptions, File};
 use sys::handle::Handle;
@@ -56,6 +54,7 @@ pub struct Command {
     args: Vec<OsString>,
     env: Option<HashMap<OsString, OsString>>,
     cwd: Option<OsString>,
+    flags: u32,
     detach: bool, // not currently exposed in std::process
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
@@ -75,6 +74,10 @@ pub struct StdioPipes {
     pub stderr: Option<AnonPipe>,
 }
 
+struct DropGuard<'a> {
+    lock: &'a Mutex,
+}
+
 impl Command {
     pub fn new(program: &OsStr) -> Command {
         Command {
@@ -82,6 +85,7 @@ impl Command {
             args: Vec::new(),
             env: None,
             cwd: None,
+            flags: 0,
             detach: false,
             stdin: None,
             stdout: None,
@@ -122,6 +126,9 @@ impl Command {
     pub fn stderr(&mut self, stderr: Stdio) {
         self.stderr = Some(stderr);
     }
+    pub fn creation_flags(&mut self, flags: u32) {
+        self.flags = flags;
+    }
 
     pub fn spawn(&mut self, default: Stdio, needs_stdin: bool)
                  -> io::Result<(Process, StdioPipes)> {
@@ -155,7 +162,7 @@ impl Command {
         cmd_str.push(0); // add null terminator
 
         // stolen from the libuv code.
-        let mut flags = c::CREATE_UNICODE_ENVIRONMENT;
+        let mut flags = self.flags | c::CREATE_UNICODE_ENVIRONMENT;
         if self.detach {
             flags |= c::DETACHED_PROCESS | c::CREATE_NEW_PROCESS_GROUP;
         }
@@ -173,8 +180,8 @@ impl Command {
         //
         // For more information, msdn also has an article about this race:
         // http://support.microsoft.com/kb/315939
-        static CREATE_PROCESS_LOCK: StaticMutex = StaticMutex::new();
-        let _lock = CREATE_PROCESS_LOCK.lock();
+        static CREATE_PROCESS_LOCK: Mutex = Mutex::new();
+        let _guard = DropGuard::new(&CREATE_PROCESS_LOCK);
 
         let mut pipes = StdioPipes {
             stdin: None,
@@ -224,6 +231,23 @@ impl fmt::Debug for Command {
     }
 }
 
+impl<'a> DropGuard<'a> {
+    fn new(lock: &'a Mutex) -> DropGuard<'a> {
+        unsafe {
+            lock.lock();
+            DropGuard { lock: lock }
+        }
+    }
+}
+
+impl<'a> Drop for DropGuard<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            self.lock.unlock();
+        }
+    }
+}
+
 impl Stdio {
     fn to_handle(&self, stdio_id: c::DWORD, pipe: &mut Option<AnonPipe>)
                  -> io::Result<Handle> {
@@ -240,19 +264,15 @@ impl Stdio {
             }
 
             Stdio::MakePipe => {
-                let (reader, writer) = pipe::anon_pipe()?;
-                let (ours, theirs) = if stdio_id == c::STD_INPUT_HANDLE {
-                    (writer, reader)
-                } else {
-                    (reader, writer)
-                };
-                *pipe = Some(ours);
+                let ours_readable = stdio_id != c::STD_INPUT_HANDLE;
+                let pipes = pipe::anon_pipe(ours_readable)?;
+                *pipe = Some(pipes.ours);
                 cvt(unsafe {
-                    c::SetHandleInformation(theirs.handle().raw(),
+                    c::SetHandleInformation(pipes.theirs.handle().raw(),
                                             c::HANDLE_FLAG_INHERIT,
                                             c::HANDLE_FLAG_INHERIT)
                 })?;
-                Ok(theirs.into_handle())
+                Ok(pipes.theirs.into_handle())
             }
 
             Stdio::Handle(ref handle) => {
@@ -320,6 +340,21 @@ impl Process {
         }
     }
 
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        unsafe {
+            match c::WaitForSingleObject(self.handle.raw(), 0) {
+                c::WAIT_OBJECT_0 => {}
+                c::WAIT_TIMEOUT => {
+                    return Ok(None);
+                }
+                _ => return Err(io::Error::last_os_error()),
+            }
+            let mut status = 0;
+            cvt(c::GetExitCodeProcess(self.handle.raw(), &mut status))?;
+            Ok(Some(ExitStatus(status)))
+        }
+    }
+
     pub fn handle(&self) -> &Handle { &self.handle }
 
     pub fn into_handle(self) -> Handle { self.handle }
@@ -334,6 +369,12 @@ impl ExitStatus {
     }
     pub fn code(&self) -> Option<i32> {
         Some(self.0 as i32)
+    }
+}
+
+impl From<c::DWORD> for ExitStatus {
+    fn from(u: c::DWORD) -> ExitStatus {
+        ExitStatus(u)
     }
 }
 
@@ -464,7 +505,6 @@ fn make_dirp(d: Option<&OsString>) -> io::Result<(*const u16, Vec<u16>)> {
 
 #[cfg(test)]
 mod tests {
-    use prelude::v1::*;
     use ffi::{OsStr, OsString};
     use super::make_command_line;
 

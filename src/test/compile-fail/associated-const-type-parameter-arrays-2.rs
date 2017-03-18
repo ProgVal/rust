@@ -25,7 +25,8 @@ impl Foo for Def {
 }
 
 pub fn test<A: Foo, B: Foo>() {
-    let _array = [4; <A as Foo>::Y]; //~ error: expected constant integer
+    let _array = [4; <A as Foo>::Y];
+    //~^ ERROR cannot use an outer type parameter in this context [E0402]
 }
 
 fn main() {
